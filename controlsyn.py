@@ -163,7 +163,7 @@ class ControlSynthesis:
             The policy.
         
         """
-        policy = np.zeros((value.shape),dtype=np.int)
+        policy = np.zeros((value.shape),dtype=int)
         for state in self.states():
             action_values = np.empty(len(self.A[state]))
             for i,action in enumerate(self.A[state]):
