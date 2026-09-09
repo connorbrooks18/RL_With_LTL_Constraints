@@ -123,7 +123,7 @@ class ControlSynthesis:
         Q = np.zeros(self.shape)
 
         for k in range(K+1):
-            if((k%5000) == 0): print(k)
+            if((k%2500) == 0): print(k)
             state = (self.shape[0]-1,self.oa.q0)+(start if start else self.mdp.random_state())
             alpha = np.max((1.0*(1 - 1.5*k/K),0.001))
             epsilon = np.max((1.0*(1 - 1.5*k/K),0.01))
@@ -133,17 +133,20 @@ class ControlSynthesis:
                 gamma = self.discountB if reward else self.discount
                 
                 # Follow an epsilon-greedy policy
-                if np.random.rand() < epsilon or np.max(Q[state])==0:
-                    action = np.random.choice(self.A[state])  # Choose among the MDP and epsilon actions
+                legal_actions = self.A[state]
+                if np.random.rand() < epsilon or max(Q[state][a] for a in legal_actions) == 0:
+                    action = np.random.choice(legal_actions)  # Choose among the MDP and epsilon actions
                 else:
-                    action = np.argmax(Q[state])
+                    action = legal_actions[np.argmax([Q[state][a] for a in legal_actions])]
                 
                 # Observe the next state
                 states, probs = self.transition_probs[state][action]
                 next_state = states[np.random.choice(len(states),p=probs)]
                 
                 # Q-update
-                Q[state][action] += alpha * (reward + gamma*np.max(Q[next_state]) - Q[state][action])
+                next_legal_actions = self.A[next_state]
+                next_value = max(Q[next_state][a] for a in next_legal_actions)
+                Q[state][action] += alpha * (reward + gamma*next_value - Q[state][action])
 
                 state = next_state
         
@@ -158,7 +161,7 @@ class ControlSynthesis:
         H = np.zeros(self.shape)
         
         for k in range(K+1):
-            if((k%5000) == 0): print(k)
+            if((k%2500) == 0): print(k)
             state = (self.shape[0]-1,self.oa.q0)+self.mdp.random_state()
             trajectory = [] # (s, a, r, pi(a|s))
             for t in range(T):
