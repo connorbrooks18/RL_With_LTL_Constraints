@@ -148,6 +148,68 @@ class ControlSynthesis:
                 state = next_state
         
         return Q
+
+    def reinforce(self, T=None, K=None):
+        # preference table is H
+        T = T if T else np.prod(self.shape[:-1])
+        K = K if K else 100000
+        alpha = 0.01
+                
+        H = np.zeros(self.shape)
+        
+        for k in range(K+1):
+            if((k%5000) == 0): print(k)
+            state = (self.shape[0]-1,self.oa.q0)+self.mdp.random_state()
+            trajectory = [] # (s, a, r, pi(a|s))
+            for t in range(T):
+
+                # create pi(* | s) from soft max of H values
+                pi = dict() # (action, probability)
+                actions = self.A[state]
+                for action in actions:
+                    pi[action] = H[state][action]
+                vals = {a: H[state][a] for a in actions}
+                max_val = max(vals.values())
+                exp_vals = {a: np.exp(vals[a] - max_val) for a in vals}
+                sum_h = sum(exp_vals.values())
+                pi = {a: exp_vals[a] / sum_h for a in exp_vals}
+                    
+                chosen_action = list(pi.keys())[np.random.choice(len(actions), p=list(pi.values()))]
+                reward = self.reward[state]
+                trajectory.append((state, chosen_action, reward, pi))
+
+                # Observe the next state
+                states, probs = self.transition_probs[state][chosen_action]
+                next_state = states[np.random.choice(len(states),p=probs)]
+
+                state = next_state
+
+            G = 0 # return with discount
+            t = T-1
+            while(t >= 0):
+                (state, action, reward, pi_state) = trajectory[t]
+                gamma = self.discountB if reward > 0 else self.discount
+                G = reward + gamma * G 
+
+                actions = self.A[state]
+                for possible_action in actions:
+                    indicator = 1 if possible_action == action else 0
+                    H[state][possible_action] = H[state][possible_action] + alpha * G * (indicator - pi_state[possible_action])
+                
+
+                t -= 1
+
+        return H
+
+    def policy_from_H(self, H):
+        policy = np.zeros(self.shape[:-1], dtype=int)
+        for state in self.states():
+            actions = self.A[state]
+            prefs = [H[state][a] for a in actions]
+            policy[state] = actions[np.argmax(prefs)]
+        return policy
+
+        
     
     def greedy_policy(self,value):
         """Returns a greedy policy for the given value function.
