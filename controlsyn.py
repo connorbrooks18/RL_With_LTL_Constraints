@@ -353,7 +353,7 @@ class ControlSynthesis:
         Each checkpoint is trained from a fresh zero-initialized learner, so
         the reported curves show performance as a function of total training
         episodes.  Performance is estimated by following the greedy policy
-        and reporting mean discounted return and the fraction of evaluation
+        and reporting mean undiscounted return and the fraction of evaluation
         episodes that finish in an accepting product state.
 
         Returns a dictionary with arrays keyed by ``episodes``, ``q_return``,
@@ -371,18 +371,27 @@ class ControlSynthesis:
             returns, successes = [], []
             for _ in range(eval_episodes):
                 state = (self.shape[0] - 1, self.oa.q0) + self.mdp.random_state()
-                total, discount = 0.0, 1.0
+                total = 0.0
                 accepted = False
                 for _ in range(horizon):
                     reward = self.reward[state]
-                    total += discount * reward
+                    # Do not discount evaluation rewards: this metric is
+                    # intended to measure raw task performance.
+                    total += reward
                     accepted = accepted or reward > 0
                     states, probs = self.transition_probs[state][policy[state]]
                     state = states[np.random.choice(len(states), p=probs)]
-                    discount *= self.discountB if reward > 0 else self.discount
                 returns.append(total)
                 successes.append(accepted)
             return float(np.mean(returns)), float(np.mean(successes))
+
+        def q_policy_from_table(q):
+            """Extract the greedy policy using only legal Q-table actions."""
+            policy = np.zeros(self.shape[:-1], dtype=int)
+            for state in self.states():
+                legal = self.A[state]
+                policy[state] = legal[np.argmax([q[state][a] for a in legal])]
+            return policy
 
         results = {k: [] for k in
                    ('episodes', 'q_return', 'reinforce_return',
@@ -392,7 +401,7 @@ class ControlSynthesis:
                 if seed is not None:
                     np.random.seed(seed)
                 q = self.q_learning(T=horizon, K=int(episodes))
-                q_policy = self.greedy_policy(np.max(q, axis=-1))
+                q_policy = q_policy_from_table(q)
                 q_ret, q_ok = evaluate(q_policy)
 
                 if seed is not None:
@@ -414,7 +423,7 @@ class ControlSynthesis:
             x = results['episodes']
             axes[0].plot(x, results['q_return'], marker='o', label='Q-learning')
             axes[0].plot(x, results['reinforce_return'], marker='o', label='REINFORCE')
-            axes[0].set(xlabel='training episodes', ylabel='mean discounted return')
+            axes[0].set(xlabel='training episodes', ylabel='mean undiscounted reward')
             axes[1].plot(x, results['q_success'], marker='o', label='Q-learning')
             axes[1].plot(x, results['reinforce_success'], marker='o', label='REINFORCE')
             axes[1].set(xlabel='training episodes', ylabel='fraction reaching acceptance')
