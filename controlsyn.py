@@ -344,3 +344,83 @@ class ControlSynthesis:
             i = IntSlider(value=0,min=0,max=self.shape[0]-1)
             q = IntSlider(value=self.oa.q0,min=0,max=self.shape[1]-1)
             interact(plot_value,i=i,q=q)
+
+
+    def compare_learning(self, checkpoints=(100, 1000, 5000, 10000),
+                         T=None, eval_episodes=100, seed=None, plot=True):
+        """Compare Q-learning and REINFORCE at training checkpoints.
+
+        Each checkpoint is trained from a fresh zero-initialized learner, so
+        the reported curves show performance as a function of total training
+        episodes.  Performance is estimated by following the greedy policy
+        and reporting mean discounted return and the fraction of evaluation
+        episodes that finish in an accepting product state.
+
+        Returns a dictionary with arrays keyed by ``episodes``, ``q_return``,
+        ``reinforce_return``, ``q_success`` and ``reinforce_success``.
+        """
+        checkpoints = np.asarray(checkpoints, dtype=int)
+        if checkpoints.ndim != 1 or np.any(checkpoints <= 0):
+            raise ValueError("checkpoints must be a 1-D sequence of positive integers")
+        if np.any(np.diff(checkpoints) < 0):
+            raise ValueError("checkpoints must be sorted")
+        horizon = int(T if T is not None else np.prod(self.shape[:-1]))
+        rng_state = np.random.get_state()
+
+        def evaluate(policy):
+            returns, successes = [], []
+            for _ in range(eval_episodes):
+                state = (self.shape[0] - 1, self.oa.q0) + self.mdp.random_state()
+                total, discount = 0.0, 1.0
+                accepted = False
+                for _ in range(horizon):
+                    reward = self.reward[state]
+                    total += discount * reward
+                    accepted = accepted or reward > 0
+                    states, probs = self.transition_probs[state][policy[state]]
+                    state = states[np.random.choice(len(states), p=probs)]
+                    discount *= self.discountB if reward > 0 else self.discount
+                returns.append(total)
+                successes.append(accepted)
+            return float(np.mean(returns)), float(np.mean(successes))
+
+        results = {k: [] for k in
+                   ('episodes', 'q_return', 'reinforce_return',
+                    'q_success', 'reinforce_success')}
+        try:
+            for episodes in checkpoints:
+                if seed is not None:
+                    np.random.seed(seed)
+                q = self.q_learning(T=horizon, K=int(episodes))
+                q_policy = self.greedy_policy(np.max(q, axis=-1))
+                q_ret, q_ok = evaluate(q_policy)
+
+                if seed is not None:
+                    np.random.seed(seed)
+                h = self.reinforce(T=horizon, K=int(episodes))
+                r_policy = self.policy_from_H(h)
+                r_ret, r_ok = evaluate(r_policy)
+
+                results['episodes'].append(int(episodes))
+                results['q_return'].append(q_ret)
+                results['reinforce_return'].append(r_ret)
+                results['q_success'].append(q_ok)
+                results['reinforce_success'].append(r_ok)
+        finally:
+            np.random.set_state(rng_state)
+
+        if plot:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+            x = results['episodes']
+            axes[0].plot(x, results['q_return'], marker='o', label='Q-learning')
+            axes[0].plot(x, results['reinforce_return'], marker='o', label='REINFORCE')
+            axes[0].set(xlabel='training episodes', ylabel='mean discounted return')
+            axes[1].plot(x, results['q_success'], marker='o', label='Q-learning')
+            axes[1].plot(x, results['reinforce_success'], marker='o', label='REINFORCE')
+            axes[1].set(xlabel='training episodes', ylabel='fraction reaching acceptance')
+            for ax in axes:
+                ax.grid(alpha=.3)
+                ax.legend()
+            fig.tight_layout()
+            results['figure'] = fig
+        return results
