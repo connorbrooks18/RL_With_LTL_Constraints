@@ -306,7 +306,7 @@ class ControlSynthesis:
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
         gamma, batch_size, tau = 0.99, 20, 0.005
-        update_every = 10
+        update_every = 100
         n_actions = self.shape[-1]
         policy_net = dqn.DQN(4, n_actions).to(device)
         target_net = dqn.DQN(4, n_actions).to(device)
