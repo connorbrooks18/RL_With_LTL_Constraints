@@ -79,7 +79,7 @@ class GridMDP():
     
     """
     
-    def __init__(self, shape, structure=None, reward=None, label=None, A=Actions, p=0.8, figsize=6, lcmap={}, cmap=plt.cm.RdBu):
+    def __init__(self, shape, structure=None, reward=None, label=None, A=Actions, p=0.8, figsize=6, lcmap={}, cmap=plt.cm.RdBu, observation_error=0.0):
         self.shape = shape
         n_rows, n_cols = shape
         
@@ -90,6 +90,7 @@ class GridMDP():
         
         self.p = p    # 80% probability goes to the right direction, 10% prob each goes to two sides 
         self.A = A
+        self.observation_error = observation_error
         
         # Create the transition matrix
         self.transition_probs = np.empty((n_rows, n_cols, len(A)),dtype=object)
@@ -100,6 +101,22 @@ class GridMDP():
         self.figsize = figsize
         self.cmap = cmap
         self.lcmap = lcmap
+
+    def observe_state(self, state, error_prob=None):
+        """Return a noisy observation without changing the true MDP state."""
+        error_prob = self.observation_error if error_prob is None else error_prob
+        if np.random.random() >= error_prob:
+            return state
+
+        row, col = state
+        candidates = []
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            neighbor = (row + dr, col + dc)
+            if (0 <= neighbor[0] < self.shape[0] and
+                    0 <= neighbor[1] < self.shape[1] and
+                    self.structure[neighbor] != 'B'):
+                candidates.append(neighbor)
+        return candidates[np.random.randint(len(candidates))] if candidates else state
         
     def states(self):
         """State generator. (s.x.: it is used as the function iterator)

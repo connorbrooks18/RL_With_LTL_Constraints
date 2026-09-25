@@ -103,6 +103,12 @@ class ControlSynthesis:
         n_mdps, n_qs, n_rows, n_cols, n_actions = self.shape
         mdp_state = np.random.randint(n_rows),np.random.randint(n_cols)
         return (np.random.randint(n_mdps),np.random.randint(n_qs)) + mdp_state
+
+    def observe_state(self, state, error_prob=None):
+        """Return the learner's noisy observation of a product state."""
+        i, q, r, c = state
+        observed_r, observed_c = self.mdp.observe_state((r, c), error_prob)
+        return (i, q, observed_r, observed_c)
     
     def q_learning(self,start=None,T=None,K=None):
         """Performs the Q-learning algorithm and returns the action values.
@@ -305,13 +311,13 @@ class ControlSynthesis:
                               "mps" if torch.backends.mps.is_available() else "cpu")
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
-        gamma, batch_size, tau = 0.99, 20, 0.005
-        update_every = 100
+        gamma, batch_size, tau = 0.99, 64, 0.01
+        update_every = 10
         n_actions = self.shape[-1]
         policy_net = dqn.DQN(4, n_actions).to(device)
         target_net = dqn.DQN(4, n_actions).to(device)
         target_net.load_state_dict(policy_net.state_dict())
-        optimizer = optim.AdamW(policy_net.parameters(), lr=3e-4, amsgrad=True)
+        optimizer = optim.AdamW(policy_net.parameters(), lr=1e-3, amsgrad=True)
         memory = dqn.ReplayMemory(10000)
         criterion = nn.SmoothL1Loss()
 
@@ -321,6 +327,9 @@ class ControlSynthesis:
             return torch.tensor([[i/max(1, ni-1), q/max(1, nq-1),
                                   r/max(1, nr-1), c/max(1, nc-1)]],
                                 dtype=torch.float32, device=device)
+
+        def observed_encoding(s):
+            return encode(self.observe_state(s))
 
         def optimize_model():
             if len(memory) < batch_size:
@@ -347,13 +356,14 @@ class ControlSynthesis:
                     tp.mul_(1-tau).add_(tau*pp)
 
         episode_returns = []
+        start = (0, 0)
         for k in range(K + 1):
             if(k % 100 == 0): print(f"Episode {k}")
             state = (self.shape[0]-1, self.oa.q0) + (start if start else self.mdp.random_state())
-            epsilon = max(1 - 1.5*k/max(1, K), 0.01)
+            epsilon = max(1 - 1.5*k/max(1, K), 0.05)
             episode_return = 0.0
             for t in range(T):
-                st = encode(state); legal = list(self.A[state])
+                st = observed_encoding(state); legal = list(self.A[state])
                 if random.random() < epsilon:
                     action = random.choice(legal)
                 else:
@@ -370,7 +380,7 @@ class ControlSynthesis:
                 memory.push(
                     st,
                     torch.tensor([[action]], dtype=torch.long, device=device),
-                    encode(next_state),
+                    observed_encoding(next_state),
                     next_mask,
                     torch.tensor([reward], dtype=torch.float32, device=device),
                     torch.tensor([transition_discount], dtype=torch.float32, device=device),
@@ -402,6 +412,9 @@ class ControlSynthesis:
         Q = np.full(self.shape, -np.inf, dtype=np.float32)
         with torch.no_grad():
             for state in self.states():
+                # Keep the returned table deterministic. During training the
+                # network receives noisy observations; the public Q-table is
+                # indexed by the corresponding clean product state.
                 Q[state] = policy_net(encode(state)).squeeze(0).cpu().numpy()
                 Q[state][list(set(range(n_actions)) - set(self.A[state]))] = -np.inf
         return Q
