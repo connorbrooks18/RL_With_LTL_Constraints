@@ -317,7 +317,7 @@ class ControlSynthesis:
         policy_net = dqn.DQN(4, n_actions).to(device)
         target_net = dqn.DQN(4, n_actions).to(device)
         target_net.load_state_dict(policy_net.state_dict())
-        optimizer = optim.AdamW(policy_net.parameters(), lr=1e-3, amsgrad=True)
+        optimizer = optim.AdamW(policy_net.parameters(), lr=1e-3, amsgrad=True, weight_decay=0.0)
         memory = dqn.ReplayMemory(10000)
         criterion = nn.SmoothL1Loss()
 
@@ -356,7 +356,6 @@ class ControlSynthesis:
                     tp.mul_(1-tau).add_(tau*pp)
 
         episode_returns = []
-        start = (0, 0)
         for k in range(K + 1):
             if(k % 100 == 0): print(f"Episode {k}")
             state = (self.shape[0]-1, self.oa.q0) + (start if start else self.mdp.random_state())
