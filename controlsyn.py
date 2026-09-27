@@ -311,22 +311,27 @@ class ControlSynthesis:
                               "mps" if torch.backends.mps.is_available() else "cpu")
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
-        gamma, batch_size, tau = 0.99, 64, 0.01
-        update_every = 10
+        batch_size, tau = 32, 0.005
+        update_every = 4
         n_actions = self.shape[-1]
-        policy_net = dqn.DQN(4, n_actions).to(device)
-        target_net = dqn.DQN(4, n_actions).to(device)
+        # Encode each discrete product-state component as a separate one-hot
+        # block: Rabin pair, automaton state, row, and column.
+        n_observations = sum(self.shape[:-1])
+        policy_net = dqn.DQN(n_observations, n_actions).to(device)
+        target_net = dqn.DQN(n_observations, n_actions).to(device)
         target_net.load_state_dict(policy_net.state_dict())
         optimizer = optim.AdamW(policy_net.parameters(), lr=1e-3, amsgrad=True, weight_decay=0.0)
-        memory = dqn.ReplayMemory(10000)
+        memory = dqn.ReplayMemory(5_000)
         criterion = nn.SmoothL1Loss()
 
         def encode(s):
-            i, q, r, c = s
-            ni, nq, nr, nc, _ = self.shape
-            return torch.tensor([[i/max(1, ni-1), q/max(1, nq-1),
-                                  r/max(1, nr-1), c/max(1, nc-1)]],
-                                dtype=torch.float32, device=device)
+            encoded = torch.zeros((1, n_observations),
+                                  dtype=torch.float32, device=device)
+            offset = 0
+            for coordinate, size in zip(s, self.shape[:-1]):
+                encoded[0, offset + int(coordinate)] = 1.0
+                offset += size
+            return encoded
 
         def observed_encoding(s):
             return encode(self.observe_state(s))
@@ -383,6 +388,8 @@ class ControlSynthesis:
                     next_mask,
                     torch.tensor([reward], dtype=torch.float32, device=device),
                     torch.tensor([transition_discount], dtype=torch.float32, device=device),
+                    reward_event=(reward != 0),
+                    epsilon_action=(action >= len(self.mdp.A)),
                 )
                 episode_return += reward
                 if (k * T + t + 1) % update_every == 0:
