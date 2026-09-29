@@ -311,8 +311,8 @@ class ControlSynthesis:
                               "mps" if torch.backends.mps.is_available() else "cpu")
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
-        batch_size, tau = 32, 0.005
-        update_every = 4
+        batch_size = 32
+        update_every, target_update_every = 32, 50
         n_actions = self.shape[-1]
         # Encode each discrete product-state component as a separate one-hot
         # block: Rabin pair, automaton state, row, and column.
@@ -356,15 +356,16 @@ class ControlSynthesis:
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
             optimizer.step()
-            with torch.no_grad():
-                for tp, pp in zip(target_net.parameters(), policy_net.parameters()):
-                    tp.mul_(1-tau).add_(tau*pp)
 
         episode_returns = []
-        for k in range(K + 1):
+        valid_start_states = [s for s in self.mdp.states()
+                              if self.mdp.structure[s] != 'B']
+        total_steps = 0
+        for k in range(K):
             if(k % 100 == 0): print(f"Episode {k}")
-            state = (self.shape[0]-1, self.oa.q0) + (start if start else self.mdp.random_state())
-            epsilon = max(1 - 1.5*k/max(1, K), 0.05)
+            mdp_start = start if start is not None else random.choice(valid_start_states)
+            state = (self.shape[0]-1, self.oa.q0) + mdp_start
+            epsilon = max(1 - 1.5*k/max(1, K), 0.01)
             episode_return = 0.0
             for t in range(T):
                 st = observed_encoding(state); legal = list(self.A[state])
@@ -380,7 +381,8 @@ class ControlSynthesis:
                 next_mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
                 next_mask[list(self.A[next_state])] = True
                 # Match tabular Q-learning: fixed horizon, but bootstrap on every step.
-                transition_discount = self.discountB if reward != 0 else self.discount
+                # Use the same reward-conditioned discount as tabular Q-learning.
+                transition_discount = self.discountB if reward else self.discount
                 memory.push(
                     st,
                     torch.tensor([[action]], dtype=torch.long, device=device),
@@ -392,9 +394,12 @@ class ControlSynthesis:
                     epsilon_action=(action >= len(self.mdp.A)),
                 )
                 episode_return += reward
-                if (k * T + t + 1) % update_every == 0:
-                    optimize_model()
                 state = next_state
+                total_steps += 1
+                if total_steps % update_every == 0:
+                    optimize_model()
+                if total_steps % target_update_every == 0:
+                    target_net.load_state_dict(policy_net.state_dict())
             episode_returns.append(episode_return)
 
         if 'plt' in globals():
