@@ -104,6 +104,14 @@ class ControlSynthesis:
         mdp_state = np.random.randint(n_rows),np.random.randint(n_cols)
         return (np.random.randint(n_mdps),np.random.randint(n_qs)) + mdp_state
 
+    def start_states(self):
+        """Return every grid cell as an eligible episode start.
+
+        This matches GridMDP.random_state: all cells are sampled uniformly,
+        including proposition-labeled and blocked cells.
+        """
+        return list(self.mdp.states())
+
     def observe_state(self, state, error_prob=None):
         """Return the learner's noisy observation of a product state."""
         i, q, r, c = state
@@ -132,12 +140,18 @@ class ControlSynthesis:
         
         T = T if T else np.prod(self.shape[:-1])
         K = K if K else 100000
-        
+
+        start_states = self.start_states()
+        if not start_states:
+            raise ValueError("Cannot train: the grid has no start states.")
+
         Q = np.zeros(self.shape)
 
         for k in range(K+1):
             if((k%2500) == 0): print(k)
-            state = (self.shape[0]-1,self.oa.q0)+(start if start else self.mdp.random_state())
+            mdp_start = (start if start is not None else
+                         start_states[np.random.randint(len(start_states))])
+            state = (self.shape[0]-1,self.oa.q0)+mdp_start
             alpha = np.max((1.0*(1 - 1.5*k/K),0.001))
             epsilon = np.max((1.0*(1 - 1.5*k/K),0.01))
             for t in range(T):
@@ -312,7 +326,10 @@ class ControlSynthesis:
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
         batch_size = 32
-        update_every, target_update_every = 32, 50
+        update_every = 32
+        # Hard-copy the target after 1,000 environment transitions (about 31
+        # optimizer updates at the current update_every setting).
+        target_update_every = 1_000
         n_actions = self.shape[-1]
         # Encode each discrete product-state component as a separate one-hot
         # block: Rabin pair, automaton state, row, and column.
@@ -358,12 +375,14 @@ class ControlSynthesis:
             optimizer.step()
 
         episode_returns = []
-        valid_start_states = [s for s in self.mdp.states()
-                              if self.mdp.structure[s] != 'B']
+        start_states = self.start_states()
+        if not start_states:
+            raise ValueError("Cannot train: the grid has no start states.")
         total_steps = 0
         for k in range(K):
             if(k % 100 == 0): print(f"Episode {k}")
-            mdp_start = start if start is not None else random.choice(valid_start_states)
+            mdp_start = (start if start is not None else
+                         start_states[np.random.randint(len(start_states))])
             state = (self.shape[0]-1, self.oa.q0) + mdp_start
             epsilon = max(1 - 1.5*k/max(1, K), 0.01)
             episode_return = 0.0

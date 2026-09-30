@@ -308,8 +308,8 @@ class GridMDP():
             color = 'white' if np.abs(value[i, j]) > threshold/2 else 'black'
             
             if policy is None:  # Print the values       
-                v = str(int(round(100*value[i,j]))).zfill(3)
-                plt.text(j, i, '$'+v[0]+'.'+v[1:]+'$',horizontalalignment='center',color=color,fontname=fontname,fontsize=fontsize+2)  # Value
+                v = f"{float(value[i, j]):.2f}"
+                plt.text(j, i, '$'+v+'$',horizontalalignment='center',color=color,fontname=fontname,fontsize=fontsize+2)  # Value
                 
             # Draw the arrows to visualize the policy
             elif value[i,j] > 0 or value is self.reward:  
