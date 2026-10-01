@@ -308,7 +308,7 @@ class GridMDP():
             color = 'white' if np.abs(value[i, j]) > threshold/2 else 'black'
             
             if policy is None:  # Print the values       
-                v = f"{float(value[i, j]):.2f}"
+                v = f"{float(value[i, j]):.2g}"
                 plt.text(j, i, '$'+v+'$',horizontalalignment='center',color=color,fontname=fontname,fontsize=fontsize+2)  # Value
                 
             # Draw the arrows to visualize the policy
