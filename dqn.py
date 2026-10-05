@@ -61,17 +61,19 @@ class ReplayMemory(object):
 
 class DQN(nn.Module):
 
-    def __init__(self, n_observations, n_actions):
+    def __init__(self, n_observations, n_actions, hidden_size=128):
         super().__init__()
         self.n_actions = n_actions
-        self.layer1 = nn.Linear(n_observations, 64)
-        self.layer2 = nn.Linear(64, 64)
-        self.layer3 = nn.Linear(64, n_actions)
+        self.layer1 = nn.Linear(n_observations, hidden_size)
+        self.layer2 = nn.Linear(hidden_size, hidden_size)
+        self.layer3 = nn.Linear(hidden_size, n_actions)
 
-    # Called with either one element to determine next action, or a batch
-    # during optimization. Returns tensor([[left0exp,right0exp]...]).
+    # Called with one state to choose an action or a batch during optimization.
+    # Returns one bounded Q estimate per action for each input state.
     def forward(self, x):
         x = F.relu(self.layer1(x))
-        
         x = F.relu(self.layer2(x))
-        return self.layer3(x)
+        # The accepting reward is 1-gammaB and uses gammaB as its discount,
+        # so the exact return is in [0, 1]. Keep function approximation inside
+        # the same range as the tabular Bellman solution.
+        return torch.sigmoid(self.layer3(x))

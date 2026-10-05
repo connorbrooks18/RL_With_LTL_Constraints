@@ -138,6 +138,8 @@ class ControlSynthesis:
             The action values learned.
         """
         
+        # T ends a rollout and resets to its configured start; it does not
+        # make the last transition terminal for the Bellman update.
         T = T if T else np.prod(self.shape[:-1])
         K = K if K else 100000
 
@@ -147,13 +149,14 @@ class ControlSynthesis:
 
         Q = np.zeros(self.shape)
 
-        for k in range(K+1):
+        for k in range(K):
             if((k%2500) == 0): print(k)
             mdp_start = (start if start is not None else
                          start_states[np.random.randint(len(start_states))])
             state = (self.shape[0]-1,self.oa.q0)+mdp_start
-            alpha = np.max((1.0*(1 - 1.5*k/K),0.001))
-            epsilon = np.max((1.0*(1 - 1.5*k/K),0.01))
+            progress = k / max(1, K - 1)
+            alpha = max(1.0 - 0.999 * progress, 0.001)
+            epsilon = max(1.0 - 0.9 * progress, 0.1)
             for t in range(T):
 
                 reward = self.reward[state]
@@ -323,13 +326,13 @@ class ControlSynthesis:
         from dqn import Transition
         device = torch.device("cuda" if torch.cuda.is_available() else
                               "mps" if torch.backends.mps.is_available() else "cpu")
+        # T is a rollout/reset horizon, not a terminal condition. Grid traps
+        # continue to accrue accepting rewards and must not be marked done.
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
-        batch_size = 32
-        update_every = 32
-        # Hard-copy the target after 1,000 environment transitions (about 31
-        # optimizer updates at the current update_every setting).
-        target_update_every = 1_000
+        batch_size = 64
+        update_every = 16
+        target_tau = 0.01
         n_actions = self.shape[-1]
         # Encode each discrete product-state component as a separate one-hot
         # block: Rabin pair, automaton state, row, and column.
@@ -337,8 +340,11 @@ class ControlSynthesis:
         policy_net = dqn.DQN(n_observations, n_actions).to(device)
         target_net = dqn.DQN(n_observations, n_actions).to(device)
         target_net.load_state_dict(policy_net.state_dict())
-        optimizer = optim.AdamW(policy_net.parameters(), lr=1e-3, amsgrad=True, weight_decay=0.0)
-        memory = dqn.ReplayMemory(5_000)
+        target_net.eval()
+        for parameter in target_net.parameters():
+            parameter.requires_grad_(False)
+        optimizer = optim.AdamW(policy_net.parameters(), lr=5e-4, amsgrad=True, weight_decay=0.0)
+        memory = dqn.ReplayMemory(20_000)
         criterion = nn.SmoothL1Loss()
 
         def encode(s):
@@ -364,28 +370,39 @@ class ControlSynthesis:
             next_values = torch.zeros(batch_size, device=device)
             if next_states:
                 with torch.no_grad():
-                    next_q = target_net(torch.cat(next_states))
                     next_masks = torch.stack([m for m in batch.next_action_mask if m is not None])
-                    next_q = next_q.masked_fill(~next_masks, -torch.inf)
-                    next_values[mask] = next_q.max(1).values
+                    # Match the tabular Bellman backup: max over legal actions
+                    # at the next state. The target network is a slowly moving
+                    # copy used only to stabilize this same max backup.
+                    target_next_q = target_net(torch.cat(next_states))
+                    target_next_q = target_next_q.masked_fill(~next_masks, -torch.inf)
+                    next_values[mask] = target_next_q.max(1).values
             expected = torch.cat(batch.reward) + torch.cat(batch.discount) * next_values
             loss = criterion(state_values, expected.unsqueeze(1))
             optimizer.zero_grad(); loss.backward()
-            torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+            torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
             optimizer.step()
+            with torch.no_grad():
+                for target_parameter, parameter in zip(target_net.parameters(), policy_net.parameters()):
+                    target_parameter.lerp_(parameter, target_tau)
 
         episode_returns = []
         start_states = self.start_states()
         if not start_states:
             raise ValueError("Cannot train: the grid has no start states.")
         total_steps = 0
+        log_every = 100
         for k in range(K):
-            if(k % 100 == 0): print(f"Episode {k}")
+            if k % log_every == 0:
+                print(f"Episode {k}/{K}")
             mdp_start = (start if start is not None else
                          start_states[np.random.randint(len(start_states))])
             state = (self.shape[0]-1, self.oa.q0) + mdp_start
-            epsilon = max(1 - 1.5*k/max(1, K), 0.01)
+            # The paper anneals exploration from 1.0 to 0.1. Keep that floor
+            # so the nondeterministic epsilon choices remain discoverable.
+            epsilon = max(1.0 - 0.9*k/max(1, K - 1), 0.1)
             episode_return = 0.0
+            return_discount = 1.0
             for t in range(T):
                 st = observed_encoding(state); legal = list(self.A[state])
                 if random.random() < epsilon:
@@ -402,6 +419,8 @@ class ControlSynthesis:
                 # Match tabular Q-learning: fixed horizon, but bootstrap on every step.
                 # Use the same reward-conditioned discount as tabular Q-learning.
                 transition_discount = self.discountB if reward else self.discount
+                episode_return += return_discount * reward
+                return_discount *= transition_discount
                 memory.push(
                     st,
                     torch.tensor([[action]], dtype=torch.long, device=device),
@@ -412,13 +431,10 @@ class ControlSynthesis:
                     reward_event=(reward != 0),
                     epsilon_action=(action >= len(self.mdp.A)),
                 )
-                episode_return += reward
                 state = next_state
                 total_steps += 1
                 if total_steps % update_every == 0:
                     optimize_model()
-                if total_steps % target_update_every == 0:
-                    target_net.load_state_dict(policy_net.state_dict())
             episode_returns.append(episode_return)
 
         if 'plt' in globals():
