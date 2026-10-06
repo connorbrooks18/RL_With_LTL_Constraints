@@ -31,7 +31,7 @@ class ControlSynthesis:
         The shape of the product MDP.
     
     reward : array, shape=(n_pairs,n_qs,n_rows,n_cols)
-        The reward function of the star-MDP. self.reward[state] = 1-discountB if 'state' belongs to B, 0 otherwise.
+        The reward function. Accepting states receive 1-discount_accepting; all other states receive 0.
         
     transition_probs : array, shape=(n_pairs,n_qs,n_rows,n_cols,n_actions)
         The transition probabilities. self.transition_probs[state][action] stores a pair of lists ([s1,s2,..],[p1,p2,...]) that contains only positive probabilities and the corresponding transitions.
@@ -44,18 +44,28 @@ class ControlSynthesis:
     oa : oa.OmegaAutomatan
         The OA obtained from the LTL specification.
         
-    discount : float
-        The discount factor.
+    discount_nonaccepting : float
+        Discount used outside the accepting set (paper's gamma).
     
-    discountB : float
-        The discount factor applied to B states.
+    discount_accepting : float
+        Discount used in accepting states (paper's gamma_B). The suffix refers
+        to the paper's accepting set B, not GridMDP's blocked-cell label 'B'.
     
     """
-    def __init__(self, mdp, oa, discount=0.99999, discountB=0.99):
+    def __init__(self, mdp, oa, discount_nonaccepting=0.99999,
+                 discount_accepting=0.99, *, discount=None, discountB=None):
+        # Keep the original keyword names working for existing notebooks.
+        if discount is not None:
+            discount_nonaccepting = discount
+        if discountB is not None:
+            discount_accepting = discountB
         self.mdp = mdp
         self.oa = oa
-        self.discount = discount
-        self.discountB = discountB  # We can also explicitly define a function of discount
+        self.discount_nonaccepting = discount_nonaccepting
+        self.discount_accepting = discount_accepting
+        # Backward-compatible attribute aliases.
+        self.discount = self.discount_nonaccepting
+        self.discountB = self.discount_accepting
         self.shape = oa.shape + mdp.shape + (len(mdp.A)+oa.shape[1],)
         
         # Create the action matrix
@@ -66,7 +76,8 @@ class ControlSynthesis:
         # Create the reward matrix
         self.reward = np.zeros(self.shape[:-1])
         for i,q,r,c in self.states():
-            self.reward[i,q,r,c] = 1-self.discountB if oa.acc[q][mdp.label[r,c]][i] else 0
+            self.reward[i,q,r,c] = (1-self.discount_accepting
+                                    if oa.acc[q][mdp.label[r,c]][i] else 0)
         
         # Create the transition matrix
         self.transition_probs = np.empty(self.shape,dtype=object)  # Enrich the action set with epsilon-actions
@@ -160,7 +171,7 @@ class ControlSynthesis:
             for t in range(T):
 
                 reward = self.reward[state]
-                gamma = self.discountB if reward else self.discount
+                gamma = self.discount_accepting if reward else self.discount_nonaccepting
                 
                 # Follow an epsilon-greedy policy
                 legal_actions = self.A[state]
@@ -235,7 +246,8 @@ class ControlSynthesis:
                 action_values = np.empty(len(self.A[state]))
                 for i,action in enumerate(self.A[state]):
                     action_values[i] = np.sum([old_value[s]*p for s,p in zip(*self.transition_probs[state][action])])
-                gamma = self.discountB if self.reward[state]>0 else self.discount
+                gamma = (self.discount_accepting if self.reward[state] > 0
+                         else self.discount_nonaccepting)
                 value[state] = self.reward[state] + gamma*np.max(action_values)
             t += 1
             d = np.nanmax(np.abs(old_value-value))
@@ -331,19 +343,22 @@ class ControlSynthesis:
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
         batch_size = 64
-        update_every = 16
-        target_tau = 0.01
+        update_every = 50
+        target_update_every = 1_000  # Hard target-network syncs in environment steps.
         n_actions = self.shape[-1]
         # Encode each discrete product-state component as a separate one-hot
         # block: Rabin pair, automaton state, row, and column.
         n_observations = sum(self.shape[:-1])
-        policy_net = dqn.DQN(n_observations, n_actions).to(device)
-        target_net = dqn.DQN(n_observations, n_actions).to(device)
+        # The 4-unit model collapsed distinct product states toward one value.
+        # Eight units per layer are a compact next step with more capacity to
+        # separate accepting and rejecting regions.
+        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=8).to(device)
+        target_net = dqn.DQN(n_observations, n_actions, hidden_size=8).to(device)
         target_net.load_state_dict(policy_net.state_dict())
         target_net.eval()
         for parameter in target_net.parameters():
             parameter.requires_grad_(False)
-        optimizer = optim.AdamW(policy_net.parameters(), lr=5e-4, amsgrad=True, weight_decay=0.0)
+        optimizer = optim.AdamW(policy_net.parameters(), lr=1e-4, amsgrad=True, weight_decay=0.0)
         memory = dqn.ReplayMemory(20_000)
         criterion = nn.SmoothL1Loss()
 
@@ -357,12 +372,37 @@ class ControlSynthesis:
             return encoded
 
         def observed_encoding(s):
-            return encode(self.observe_state(s))
+            return encoded_states[self.observe_state(s)]
+
+        # These state and action encodings are immutable during training, so
+        # build them once instead of allocating device tensors on every step.
+        encoded_states = {state: encode(state) for state in self.states()}
+        action_masks = {}
+        for state in self.states():
+            mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
+            mask[self.A[state]] = True
+            action_masks[state] = mask
+        action_tensors = [torch.tensor([[action]], dtype=torch.long, device=device)
+                          for action in range(n_actions)]
+        reward_tensors = {
+            False: torch.tensor([0.0], dtype=torch.float32, device=device),
+            True: torch.tensor([1.0 - self.discount_accepting],
+                               dtype=torch.float32, device=device),
+        }
+        discount_tensors = {
+            False: torch.tensor([self.discount_nonaccepting],
+                                dtype=torch.float32, device=device),
+            True: torch.tensor([self.discount_accepting],
+                               dtype=torch.float32, device=device),
+        }
 
         def optimize_model():
             if len(memory) < batch_size:
                 return
-            batch = Transition(*zip(*memory.sample(batch_size)))
+            # Uniform replay avoids overweighting rare accepting rewards in
+            # the shared function approximator.
+            batch = Transition(*zip(*memory.sample(
+                batch_size, reward_fraction=0.0, epsilon_fraction=0.0)))
             mask = torch.tensor([s is not None for s in batch.next_state],
                                 device=device, dtype=torch.bool)
             next_states = [s for s in batch.next_state if s is not None]
@@ -371,70 +411,80 @@ class ControlSynthesis:
             if next_states:
                 with torch.no_grad():
                     next_masks = torch.stack([m for m in batch.next_action_mask if m is not None])
-                    # Match the tabular Bellman backup: max over legal actions
-                    # at the next state. The target network is a slowly moving
-                    # copy used only to stabilize this same max backup.
+                    # Double DQN: the online network selects the best legal
+                    # next action; the target network evaluates that action.
+                    # This reduces the positive bias from taking a noisy max.
+                    online_next_q = policy_net(torch.cat(next_states))
+                    online_next_q = online_next_q.masked_fill(~next_masks, -torch.inf)
+                    next_actions = online_next_q.argmax(dim=1, keepdim=True)
                     target_next_q = target_net(torch.cat(next_states))
-                    target_next_q = target_next_q.masked_fill(~next_masks, -torch.inf)
-                    next_values[mask] = target_next_q.max(1).values
+                    target_next_q = target_next_q.gather(1, next_actions).squeeze(1)
+                    # True values are in [0,1] for this reward/discount pair.
+                    # Project only the bootstrap target; leave online Q values
+                    # unclipped so approximation errors remain observable.
+                    next_values[mask] = target_next_q.clamp(0.0, 1.0)
             expected = torch.cat(batch.reward) + torch.cat(batch.discount) * next_values
             loss = criterion(state_values, expected.unsqueeze(1))
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
             optimizer.step()
-            with torch.no_grad():
-                for target_parameter, parameter in zip(target_net.parameters(), policy_net.parameters()):
-                    target_parameter.lerp_(parameter, target_tau)
 
         episode_returns = []
         start_states = self.start_states()
         if not start_states:
             raise ValueError("Cannot train: the grid has no start states.")
         total_steps = 0
-        log_every = 100
+        log_every = max(1, K // 100)
         for k in range(K):
             if k % log_every == 0:
                 print(f"Episode {k}/{K}")
             mdp_start = (start if start is not None else
                          start_states[np.random.randint(len(start_states))])
             state = (self.shape[0]-1, self.oa.q0) + mdp_start
+            st = observed_encoding(state)
             # The paper anneals exploration from 1.0 to 0.1. Keep that floor
             # so the nondeterministic epsilon choices remain discoverable.
             epsilon = max(1.0 - 0.9*k/max(1, K - 1), 0.1)
             episode_return = 0.0
             return_discount = 1.0
             for t in range(T):
-                st = observed_encoding(state); legal = list(self.A[state])
+                legal = self.A[state]
                 if random.random() < epsilon:
                     action = random.choice(legal)
                 else:
                     with torch.no_grad():
                         v = policy_net(st).squeeze(0)
-                    action = max(legal, key=lambda a: v[a].item())
+                        v = v.masked_fill(~action_masks[state], -torch.inf)
+                    action = int(v.argmax().item())
                 states, probs = self.transition_probs[state][action]
                 next_state = states[np.random.choice(len(states), p=probs)]
+                next_st = observed_encoding(next_state)
                 reward = float(self.reward[state])
-                next_mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
-                next_mask[list(self.A[next_state])] = True
+                next_mask = action_masks[next_state]
                 # Match tabular Q-learning: fixed horizon, but bootstrap on every step.
                 # Use the same reward-conditioned discount as tabular Q-learning.
-                transition_discount = self.discountB if reward else self.discount
+                transition_discount = (self.discount_accepting if reward
+                                       else self.discount_nonaccepting)
                 episode_return += return_discount * reward
                 return_discount *= transition_discount
+                reward_event = reward != 0
                 memory.push(
                     st,
-                    torch.tensor([[action]], dtype=torch.long, device=device),
-                    observed_encoding(next_state),
+                    action_tensors[action],
+                    next_st,
                     next_mask,
-                    torch.tensor([reward], dtype=torch.float32, device=device),
-                    torch.tensor([transition_discount], dtype=torch.float32, device=device),
-                    reward_event=(reward != 0),
+                    reward_tensors[reward_event],
+                    discount_tensors[reward_event],
+                    reward_event=reward_event,
                     epsilon_action=(action >= len(self.mdp.A)),
                 )
                 state = next_state
+                st = next_st
                 total_steps += 1
                 if total_steps % update_every == 0:
                     optimize_model()
+                if total_steps % target_update_every == 0:
+                    target_net.load_state_dict(policy_net.state_dict())
             episode_returns.append(episode_return)
 
         if 'plt' in globals():
@@ -461,8 +511,6 @@ class ControlSynthesis:
                 # Keep the returned table deterministic. During training the
                 # network receives noisy observations; the public Q-table is
                 # indexed by the corresponding clean product state.
-                Q[state] = policy_net(encode(state)).squeeze(0).cpu().numpy()
+                Q[state] = policy_net(encoded_states[state]).squeeze(0).cpu().numpy()
                 Q[state][list(set(range(n_actions)) - set(self.A[state]))] = -np.inf
         return Q
-
-
