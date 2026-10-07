@@ -378,8 +378,8 @@ class ControlSynthesis:
         # A prior run collapsed distinct product states toward one value.
         # Thirty-two units per layer give the factored encoding more capacity
         # to separate accepting and rejecting regions.
-        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=32).to(device)
-        target_net = dqn.DQN(n_observations, n_actions, hidden_size=32).to(device)
+        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=64).to(device)
+        target_net = dqn.DQN(n_observations, n_actions, hidden_size=64).to(device)
         target_net.load_state_dict(policy_net.state_dict())
         target_net.eval()
         for parameter in target_net.parameters():
@@ -442,10 +442,7 @@ class ControlSynthesis:
         def optimize_model():
             if len(memory) < batch_size:
                 return
-            # Keep accepting transitions and nondeterministic epsilon choices
-            # represented in replay; both are sparse but essential here.
-            batch = Transition(*zip(*memory.sample(
-                batch_size, reward_fraction=0.25, epsilon_fraction=0.25)))
+            batch = Transition(*zip(*memory.sample(batch_size)))
             mask = torch.tensor([s is not None for s in batch.next_state],
                                 device=device, dtype=torch.bool)
             next_states = [s for s in batch.next_state if s is not None]
@@ -523,8 +520,6 @@ class ControlSynthesis:
                     next_mask,
                     reward_tensors[reward_event],
                     discount_tensors[reward_event],
-                    reward_event=reward_event,
-                    epsilon_action=(action >= len(self.mdp.A)),
                 )
                 state = next_state
                 st = next_st
