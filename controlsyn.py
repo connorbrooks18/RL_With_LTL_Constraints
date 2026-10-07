@@ -235,24 +235,47 @@ class ControlSynthesis:
         value: array, size=(n_mdps,n_qs,n_rows,n_cols)
             The value function.
         """
-        value = np.zeros(self.shape[:-1])
-        old_value = np.copy(value)
-        t = 0  # The time step
-        d = np.inf  # The difference between the last two steps
-        while (T and t<T) or (threshold and d>threshold):
-            value, old_value = old_value, value
-            for state in self.states():
-                # Bellman operator
-                action_values = np.empty(len(self.A[state]))
-                for i,action in enumerate(self.A[state]):
-                    action_values[i] = np.sum([old_value[s]*p for s,p in zip(*self.transition_probs[state][action])])
-                gamma = (self.discount_accepting if self.reward[state] > 0
-                         else self.discount_nonaccepting)
-                value[state] = self.reward[state] + gamma*np.max(action_values)
+        states = list(self.states())
+        state_indices = {state: index for index, state in enumerate(states)}
+        n_states = len(states)
+        n_actions = self.shape[-1]
+        n_outcomes = max(
+            len(self.transition_probs[state][action][0])
+            for state in states for action in self.A[state]
+        )
+
+        # Pad legal action outcomes into dense arrays once. The Bellman sweep
+        # can then run over all states and actions with NumPy instead of
+        # rebuilding Python lists for every state on every iteration.
+        next_indices = np.zeros((n_states, n_actions, n_outcomes), dtype=np.intp)
+        probabilities = np.zeros((n_states, n_actions, n_outcomes), dtype=float)
+        legal_actions = np.zeros((n_states, n_actions), dtype=bool)
+        rewards = np.empty(n_states, dtype=float)
+        discounts = np.empty(n_states, dtype=float)
+        for index, state in enumerate(states):
+            rewards[index] = self.reward[state]
+            discounts[index] = (self.discount_accepting if rewards[index] > 0
+                                else self.discount_nonaccepting)
+            for action in self.A[state]:
+                legal_actions[index, action] = True
+                successors, probs = self.transition_probs[state][action]
+                count = len(successors)
+                next_indices[index, action, :count] = [state_indices[s] for s in successors]
+                probabilities[index, action, :count] = probs
+
+        old_value = np.zeros(n_states, dtype=float)
+        t = 0
+        d = np.inf
+        while (T and t < T) or (threshold and d > threshold):
+            successor_values = old_value[next_indices]
+            action_values = np.sum(successor_values * probabilities, axis=2)
+            action_values[~legal_actions] = -np.inf
+            value = rewards + discounts * np.max(action_values, axis=1)
             t += 1
-            d = np.nanmax(np.abs(old_value-value))
-            
-        return value
+            d = np.max(np.abs(old_value - value))
+            old_value = value
+
+        return old_value.reshape(self.shape[:-1])
     
     def simulate(self,value,policy,start=None,T=None,plot=True, animation=None):
         """Simulates the environment and returns a trajectory obtained under the given policy.
@@ -336,8 +359,11 @@ class ControlSynthesis:
         import random
         import dqn
         from dqn import Transition
-        device = torch.device("cuda" if torch.cuda.is_available() else
-                              "mps" if torch.backends.mps.is_available() else "cpu")
+        # Actions are selected one state at a time, where MPS launch and
+        # synchronization costs dominate this small network. Use CPU for this
+        # sequential loop; it benchmarks substantially faster on the thesis
+        # grid while batched replay updates remain inexpensive.
+        device = torch.device("cpu")
         # T is a rollout/reset horizon, not a terminal condition. Grid traps
         # continue to accrue accepting rewards and must not be marked done.
         T = T if T else int(np.prod(self.shape[:-1]))
@@ -416,10 +442,10 @@ class ControlSynthesis:
         def optimize_model():
             if len(memory) < batch_size:
                 return
-            # Uniform replay avoids overweighting rare accepting rewards in
-            # the shared function approximator.
+            # Keep accepting transitions and nondeterministic epsilon choices
+            # represented in replay; both are sparse but essential here.
             batch = Transition(*zip(*memory.sample(
-                batch_size, reward_fraction=0.0, epsilon_fraction=0.0)))
+                batch_size, reward_fraction=0.25, epsilon_fraction=0.25)))
             mask = torch.tensor([s is not None for s in batch.next_state],
                                 device=device, dtype=torch.bool)
             next_states = [s for s in batch.next_state if s is not None]
