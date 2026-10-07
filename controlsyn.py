@@ -343,21 +343,38 @@ class ControlSynthesis:
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
         batch_size = 64
-        update_every = 50
+        update_every = 10
         target_update_every = 1_000  # Hard target-network syncs in environment steps.
         n_actions = self.shape[-1]
-        # Encode each discrete product-state component as a separate one-hot
-        # block: Rabin pair, automaton state, row, and column.
+        # Encode the four product-state components as separate one-hot blocks:
+        # Rabin pair, automaton state, row, and column.
         n_observations = sum(self.shape[:-1])
-        # The 4-unit model collapsed distinct product states toward one value.
-        # Eight units per layer are a compact next step with more capacity to
-        # separate accepting and rejecting regions.
-        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=8).to(device)
-        target_net = dqn.DQN(n_observations, n_actions, hidden_size=8).to(device)
+        # A prior run collapsed distinct product states toward one value.
+        # Thirty-two units per layer give the factored encoding more capacity
+        # to separate accepting and rejecting regions.
+        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=32).to(device)
+        target_net = dqn.DQN(n_observations, n_actions, hidden_size=32).to(device)
         target_net.load_state_dict(policy_net.state_dict())
         target_net.eval()
         for parameter in target_net.parameters():
             parameter.requires_grad_(False)
+        # A deterministic rejecting sink has zero continuation value: it has
+        # no epsilon exits, every automaton edge returns to itself, and no
+        # transition is accepting. Removing its bootstrap is Bellman-equivalent
+        # to the tabular fixed point and prevents approximation error in the
+        # sink from leaking backward into its predecessor states. Accepting
+        # absorbing states do not meet this condition and keep bootstrapping.
+        rejecting_sink_qs = {
+            q for q in range(self.oa.shape[1])
+            if not self.oa.eps[q]
+            and self.oa.delta[q]
+            and all(destination == q for destination in self.oa.delta[q].values())
+            and not any(
+                status is True
+                for statuses in self.oa.acc[q].values()
+                for status in statuses
+            )
+        }
         optimizer = optim.AdamW(policy_net.parameters(), lr=1e-4, amsgrad=True, weight_decay=0.0)
         memory = dqn.ReplayMemory(20_000)
         criterion = nn.SmoothL1Loss()
@@ -459,8 +476,13 @@ class ControlSynthesis:
                 states, probs = self.transition_probs[state][action]
                 next_state = states[np.random.choice(len(states), p=probs)]
                 next_st = observed_encoding(next_state)
+                next_is_rejecting_sink = next_state[1] in rejecting_sink_qs
                 reward = float(self.reward[state])
-                next_mask = action_masks[next_state]
+                # Use None only in the replay target for a proven zero-value
+                # sink. The rollout itself continues so this changes no reward
+                # semantics or accepting-state behavior.
+                replay_next_st = None if next_is_rejecting_sink else next_st
+                next_mask = None if next_is_rejecting_sink else action_masks[next_state]
                 # Match tabular Q-learning: fixed horizon, but bootstrap on every step.
                 # Use the same reward-conditioned discount as tabular Q-learning.
                 transition_discount = (self.discount_accepting if reward
@@ -471,7 +493,7 @@ class ControlSynthesis:
                 memory.push(
                     st,
                     action_tensors[action],
-                    next_st,
+                    replay_next_st,
                     next_mask,
                     reward_tensors[reward_event],
                     discount_tensors[reward_event],
