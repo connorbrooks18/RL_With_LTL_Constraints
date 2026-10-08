@@ -355,7 +355,12 @@ class ControlSynthesis:
             q = IntSlider(value=self.oa.q0,min=0,max=self.shape[1]-1)
             interact(plot_value,i=i,q=q)
 
-    def deep_q_learning(self, start=None, T=None, K=None):
+    def deep_q_learning(self, start=None, T=None, K=None, *,
+                        epsilon_floor=0.1, learning_rate=1e-4,
+                        automaton_action_probability=0.2,
+                        return_diagnostics=False, architecture="linear",
+                        replay_capacity=100_000, batch_size=128,
+                        target_update_every=250):
         import random
         import dqn
         from dqn import Transition
@@ -368,18 +373,21 @@ class ControlSynthesis:
         # continue to accrue accepting rewards and must not be marked done.
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
-        batch_size = 64
-        update_every = 10
-        target_update_every = 1_000  # Hard target-network syncs in environment steps.
+        update_every = 4
         n_actions = self.shape[-1]
-        # Encode the four product-state components as separate one-hot blocks:
-        # Rabin pair, automaton state, row, and column.
-        n_observations = sum(self.shape[:-1])
-        # A prior run collapsed distinct product states toward one value.
-        # Thirty-two units per layer give the factored encoding more capacity
-        # to separate accepting and rejecting regions.
-        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=64).to(device)
-        target_net = dqn.DQN(n_observations, n_actions, hidden_size=64).to(device)
+        if architecture == "mlp":
+            # Encode product-state components in separate one-hot blocks.
+            n_observations = sum(self.shape[:-1])
+            hidden_size = 64
+        elif architecture == "linear":
+            # A one-hot state index gives every product-state/action pair an
+            # independent learned value; this isolates approximation sharing.
+            n_observations = int(np.prod(self.shape[:-1]))
+            hidden_size = None
+        else:
+            raise ValueError("architecture must be 'mlp' or 'linear'")
+        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=hidden_size).to(device)
+        target_net = dqn.DQN(n_observations, n_actions, hidden_size=hidden_size).to(device)
         target_net.load_state_dict(policy_net.state_dict())
         target_net.eval()
         for parameter in target_net.parameters():
@@ -401,17 +409,22 @@ class ControlSynthesis:
                 for status in statuses
             )
         }
-        optimizer = optim.AdamW(policy_net.parameters(), lr=1e-4, amsgrad=True, weight_decay=0.0)
-        memory = dqn.ReplayMemory(20_000)
+        optimizer = optim.AdamW(policy_net.parameters(), lr=learning_rate,
+                                 amsgrad=True, weight_decay=0.0)
+        memory = dqn.ReplayMemory(replay_capacity)
         criterion = nn.SmoothL1Loss()
 
         def encode(s):
             encoded = torch.zeros((1, n_observations),
                                   dtype=torch.float32, device=device)
-            offset = 0
-            for coordinate, size in zip(s, self.shape[:-1]):
-                encoded[0, offset + int(coordinate)] = 1.0
-                offset += size
+            if architecture == "linear":
+                index = np.ravel_multi_index(tuple(map(int, s)), self.shape[:-1])
+                encoded[0, index] = 1.0
+            else:
+                offset = 0
+                for coordinate, size in zip(s, self.shape[:-1]):
+                    encoded[0, offset + int(coordinate)] = 1.0
+                    offset += size
             return encoded
 
         def observed_encoding(s):
@@ -474,6 +487,7 @@ class ControlSynthesis:
         if not start_states:
             raise ValueError("Cannot train: the grid has no start states.")
         total_steps = 0
+        transition_counts = np.zeros(self.shape, dtype=np.int64)
         log_every = max(1, K // 100)
         for k in range(K):
             if k % log_every == 0:
@@ -482,20 +496,29 @@ class ControlSynthesis:
                          start_states[np.random.randint(len(start_states))])
             state = (self.shape[0]-1, self.oa.q0) + mdp_start
             st = observed_encoding(state)
-            # The paper anneals exploration from 1.0 to 0.1. Keep that floor
-            # so the nondeterministic epsilon choices remain discoverable.
-            epsilon = max(1.0 - 0.9*k/max(1, K - 1), 0.1)
+            # The paper anneals epsilon from 1.0 to 0.1. The separate
+            # automaton-action probability improves coverage of legal
+            # epsilon branches while leaving replay sampling uniform.
+            epsilon = max(
+                1.0 - (1.0 - epsilon_floor) * k / max(1, K - 1),
+                epsilon_floor,
+            )
             episode_return = 0.0
             return_discount = 1.0
             for t in range(T):
                 legal = self.A[state]
-                if random.random() < epsilon:
+                automaton_actions = [a for a in legal if a >= len(self.mdp.A)]
+                if (automaton_actions
+                        and random.random() < automaton_action_probability):
+                    action = random.choice(automaton_actions)
+                elif random.random() < epsilon:
                     action = random.choice(legal)
                 else:
                     with torch.no_grad():
                         v = policy_net(st).squeeze(0)
                         v = v.masked_fill(~action_masks[state], -torch.inf)
                     action = int(v.argmax().item())
+                transition_counts[state + (action,)] += 1
                 states, probs = self.transition_probs[state][action]
                 next_state = states[np.random.choice(len(states), p=probs)]
                 next_st = observed_encoding(next_state)
@@ -513,14 +536,15 @@ class ControlSynthesis:
                 episode_return += return_discount * reward
                 return_discount *= transition_discount
                 reward_event = reward != 0
-                memory.push(
-                    st,
-                    action_tensors[action],
-                    replay_next_st,
-                    next_mask,
-                    reward_tensors[reward_event],
-                    discount_tensors[reward_event],
-                )
+                if state[1] not in rejecting_sink_qs:
+                    memory.push(
+                        st,
+                        action_tensors[action],
+                        replay_next_st,
+                        next_mask,
+                        reward_tensors[reward_event],
+                        discount_tensors[reward_event],
+                    )
                 state = next_state
                 st = next_st
                 total_steps += 1
@@ -556,4 +580,8 @@ class ControlSynthesis:
                 # indexed by the corresponding clean product state.
                 Q[state] = policy_net(encoded_states[state]).squeeze(0).cpu().numpy()
                 Q[state][list(set(range(n_actions)) - set(self.A[state]))] = -np.inf
+                if state[1] in rejecting_sink_qs:
+                    Q[state][self.A[state]] = 0.0
+        if return_diagnostics:
+            return Q, transition_counts
         return Q
