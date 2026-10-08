@@ -360,7 +360,8 @@ class ControlSynthesis:
                         automaton_action_probability=0.2,
                         return_diagnostics=False, architecture="linear",
                         replay_capacity=100_000, batch_size=128,
-                        target_update_every=250):
+                        target_update_every=250,
+                        checkpoint_dir="checkpoints"):
         import random
         import dqn
         from dqn import Transition
@@ -489,6 +490,13 @@ class ControlSynthesis:
         total_steps = 0
         transition_counts = np.zeros(self.shape, dtype=np.int64)
         log_every = max(1, K // 100)
+        from datetime import datetime, timezone
+        import hashlib
+        from pathlib import Path
+        import subprocess
+        import time
+        run_started_at = datetime.now(timezone.utc)
+        run_started_perf = time.perf_counter()
         for k in range(K):
             if k % log_every == 0:
                 print(f"Episode {k}/{K}")
@@ -582,6 +590,105 @@ class ControlSynthesis:
                 Q[state][list(set(range(n_actions)) - set(self.A[state]))] = -np.inf
                 if state[1] in rejecting_sink_qs:
                     Q[state][self.A[state]] = 0.0
+
+        if checkpoint_dir is not None:
+            import json
+
+            project_dir = Path(__file__).resolve().parent
+            checkpoint_root = Path(checkpoint_dir).expanduser()
+            if not checkpoint_root.is_absolute():
+                checkpoint_root = project_dir / checkpoint_root
+            checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+            def git_output(*args):
+                try:
+                    return subprocess.check_output(
+                        ["git", *args], cwd=project_dir, text=True,
+                        stderr=subprocess.DEVNULL,
+                    ).strip()
+                except (OSError, subprocess.CalledProcessError):
+                    return None
+
+            git_commit = git_output("rev-parse", "HEAD")
+            git_status = git_output("status", "--porcelain", "--untracked-files=all")
+            dirty_files = (
+                [line[3:] for line in git_status.splitlines() if line]
+                if git_status is not None else None
+            )
+            source_hashes = {}
+            for source_name in ("controlsyn.py", "dqn.py"):
+                source_path = project_dir / source_name
+                if source_path.exists():
+                    source_hashes[source_name] = hashlib.sha256(
+                        source_path.read_bytes()
+                    ).hexdigest()
+
+            run_finished_at = datetime.now(timezone.utc)
+            timestamp = run_started_at.strftime("%Y%m%dT%H%M%S.%fZ")
+            commit_tag = git_commit[:7] if git_commit else "nogit"
+            run_id = f"{timestamp}_K{K}_T{T}_{commit_tag}"
+            metadata = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "started_at_utc": run_started_at.isoformat(),
+                "finished_at_utc": run_finished_at.isoformat(),
+                "elapsed_seconds": time.perf_counter() - run_started_perf,
+                "episodes": int(K),
+                "steps_per_episode": int(T),
+                "environment_steps": int(total_steps),
+                "start_mdp_square": list(map(int, start)) if start is not None else None,
+                "start_sampling": (
+                    "uniform over grid states" if start is None else "fixed square"
+                ),
+                "epsilon_schedule": "linear from 1.0 to epsilon_floor",
+                "epsilon_floor": float(epsilon_floor),
+                "learning_rate": float(learning_rate),
+                "automaton_action_probability": float(automaton_action_probability),
+                "architecture": architecture,
+                "n_observations": int(n_observations),
+                "n_actions": int(n_actions),
+                "hidden_size": hidden_size,
+                "replay_capacity": int(replay_capacity),
+                "batch_size": int(batch_size),
+                "update_every": int(update_every),
+                "target_update_every": int(target_update_every),
+                "discount_nonaccepting": float(self.discount_nonaccepting),
+                "discount_accepting": float(self.discount_accepting),
+                "product_state_shape": list(map(int, self.shape[:-1])),
+                "mdp_shape": list(map(int, self.mdp.shape)),
+                "automaton_shape": list(map(int, self.oa.shape)),
+                "automaton_initial_state": int(self.oa.q0),
+                "git_commit": git_commit,
+                "git_dirty_files": dirty_files,
+                "source_sha256": source_hashes,
+            }
+            checkpoint_path = checkpoint_root / f"dqn_{run_id}.pt"
+            checkpoint_tmp = checkpoint_path.with_suffix(".pt.tmp")
+            checkpoint = {
+                "metadata": metadata,
+                "policy_state_dict": {
+                    key: value.detach().cpu()
+                    for key, value in policy_net.state_dict().items()
+                },
+                "target_state_dict": {
+                    key: value.detach().cpu()
+                    for key, value in target_net.state_dict().items()
+                },
+                "optimizer_state_dict": optimizer.state_dict(),
+                "q_values": torch.from_numpy(Q.copy()),
+            }
+            torch.save(checkpoint, checkpoint_tmp)
+            os.replace(checkpoint_tmp, checkpoint_path)
+
+            # Keep a readable metadata sidecar next to the full PyTorch checkpoint.
+            metadata_path = checkpoint_path.with_suffix(".json")
+            metadata_tmp = metadata_path.with_suffix(".json.tmp")
+            with metadata_tmp.open("w", encoding="utf-8") as metadata_file:
+                json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+                metadata_file.write("\n")
+            os.replace(metadata_tmp, metadata_path)
+            self.last_checkpoint_path = str(checkpoint_path)
+            print(f"Saved DQN checkpoint: {checkpoint_path}")
         if return_diagnostics:
             return Q, transition_counts
         return Q
