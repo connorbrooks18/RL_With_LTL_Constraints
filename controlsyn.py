@@ -124,10 +124,159 @@ class ControlSynthesis:
         return list(self.mdp.states())
 
     def observe_state(self, state, error_prob=None):
-        """Return the learner's noisy observation of a product state."""
+        """Return a noisy product-state observation, retaining automaton q.
+
+        This is the legacy fully-observed product-state interface. Use
+        :meth:`observe_observation` for a POMDP observation, which does not
+        reveal the hidden automaton state.
+        """
         i, q, r, c = state
         observed_r, observed_c = self.mdp.observe_state((r, c), error_prob)
         return (i, q, observed_r, observed_c)
+
+    def observe_observation(self, state, error_prob=None):
+        """Return the visible observation ``(pair, row, column)``.
+
+        The true automaton state is intentionally omitted. Rewards and
+        product-state transitions continue to use the true state.
+        """
+        i, _q, r, c = state
+        observed_r, observed_c = self.mdp.observe_state((r, c), error_prob)
+        return (i, observed_r, observed_c)
+
+    def encode_observation(self, observation, *, partial_observation=True,
+                           previous_action=None, recurrent=False):
+        """One-hot encode an observation for a DQN or recurrent DQN.
+
+        For partial observations, pass ``(pair, row, column)``. For full
+        product-state observations, pass ``(pair, q, row, column)``. Recurrent
+        tokens append a valid-token bit and, when present, the preceding action
+        as a one-hot vector. Left-padding tokens are all zeros; the history
+        encoder appends persistent one-hot epsilon-target memory separately.
+        """
+        observation = tuple(map(int, observation))
+        if partial_observation:
+            if len(observation) != 3:
+                raise ValueError("Partial observations must be (pair, row, column)")
+            factors = (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
+        else:
+            if len(observation) != 4:
+                raise ValueError("Product observations must be (pair, q, row, column)")
+            factors = self.shape[:-1]
+
+        feature_count = sum(factors) + (1 + self.shape[-1] if recurrent else 0)
+        encoded = torch.zeros(feature_count, dtype=torch.float32)
+        offset = 0
+        for coordinate, size in zip(observation, factors):
+            if coordinate < 0 or coordinate >= size:
+                raise ValueError(f"Observation coordinate {coordinate} is out of range")
+            encoded[offset + coordinate] = 1.0
+            offset += size
+
+        if recurrent:
+            encoded[offset] = 1.0  # distinguishes a real all-zero-like token from padding
+            if previous_action is not None:
+                previous_action = int(previous_action)
+                if previous_action < 0 or previous_action >= self.shape[-1]:
+                    raise ValueError("previous_action is outside the DQN action range")
+                encoded[offset + 1 + previous_action] = 1.0
+        return encoded
+
+    def encode_observation_history(self, observations, history_length, *,
+                                   previous_actions=None,
+                                   partial_observation=True,
+                                   epsilon_committed=False,
+                                   epsilon_target=None,
+                                   epsilon_commitment_mode=None,
+                                   include_epsilon_commitment=None):
+        """Encode and left-pad a history for :class:`dqn.GRUDQN`.
+
+        ``observations`` are ordered oldest to newest. ``previous_actions``
+        contains the action taken immediately before each corresponding
+        observation, or ``None`` for the first observation after reset.
+        Histories longer than ``history_length`` are truncated from the left.
+        By default, persistent one-hot features record the target of the most
+        recent epsilon edge chosen by the controller. This is derived from
+        its own actions, not from the hidden automaton state. The legacy
+        ``bit`` mode supports checkpoints that stored only whether an epsilon
+        edge had been chosen; ``none`` supports older checkpoints.
+        """
+        if history_length <= 0:
+            raise ValueError("history_length must be positive")
+        factors = (
+            (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
+            if partial_observation else self.shape[:-1]
+        )
+        observations = list(observations)
+        if previous_actions is None:
+            previous_actions = [None] * len(observations)
+        else:
+            previous_actions = list(previous_actions)
+            if len(previous_actions) != len(observations):
+                raise ValueError("observations and previous_actions must have equal length")
+        if not observations:
+            raise ValueError("At least one observation is required")
+
+        if epsilon_commitment_mode is None:
+            if include_epsilon_commitment is False:
+                epsilon_commitment_mode = "none"
+            elif include_epsilon_commitment is True:
+                # Preserve the old public option for existing notebooks.
+                epsilon_commitment_mode = "bit"
+            else:
+                epsilon_commitment_mode = "target_one_hot"
+        if epsilon_commitment_mode not in ("target_one_hot", "bit", "none"):
+            raise ValueError(
+                "epsilon_commitment_mode must be 'target_one_hot', 'bit', or 'none'"
+            )
+        if epsilon_target is None:
+            epsilon_actions = [
+                int(action) for action in previous_actions
+                if action is not None and int(action) >= len(self.mdp.A)
+            ]
+            if epsilon_actions:
+                epsilon_target = epsilon_actions[-1] - len(self.mdp.A)
+        if epsilon_target is not None:
+            epsilon_target = int(epsilon_target)
+            if epsilon_target < 0 or epsilon_target >= self.shape[1]:
+                raise ValueError("epsilon_target is outside the automaton state range")
+        if (epsilon_commitment_mode == "target_one_hot"
+                and epsilon_committed and epsilon_target is None):
+            raise ValueError(
+                "target_one_hot commitment needs epsilon_target or an epsilon action "
+                "in previous_actions"
+            )
+
+        tokens = [
+            self.encode_observation(
+                observation,
+                partial_observation=partial_observation,
+                previous_action=action,
+                recurrent=True,
+            )
+            for observation, action in zip(observations, previous_actions)
+        ][-history_length:]
+        if len(tokens) < history_length:
+            padding = [torch.zeros_like(tokens[0])
+                       for _ in range(history_length - len(tokens))]
+            tokens = padding + tokens
+        encoded_history = torch.stack(tokens)
+        if epsilon_commitment_mode == "target_one_hot":
+            valid_token_index = sum(factors)
+            valid_tokens = encoded_history[:, valid_token_index:valid_token_index + 1]
+            target_features = torch.zeros(
+                self.shape[1], dtype=torch.float32
+            )
+            if epsilon_target is not None:
+                target_features[epsilon_target] = 1.0
+            commitment = valid_tokens * target_features.unsqueeze(0)
+            encoded_history = torch.cat((encoded_history, commitment), dim=1)
+        elif epsilon_commitment_mode == "bit":
+            valid_token_index = sum(factors)
+            valid_tokens = encoded_history[:, valid_token_index:valid_token_index + 1]
+            commitment = valid_tokens * float(bool(epsilon_committed or epsilon_target is not None))
+            encoded_history = torch.cat((encoded_history, commitment), dim=1)
+        return encoded_history
     
     def q_learning(self,start=None,T=None,K=None):
         """Performs the Q-learning algorithm and returns the action values.
@@ -361,7 +510,27 @@ class ControlSynthesis:
                         return_diagnostics=False, architecture="linear",
                         replay_capacity=100_000, batch_size=128,
                         target_update_every=250,
-                        checkpoint_dir="checkpoints"):
+                        checkpoint_dir="checkpoints", history_length=5,
+                        gru_hidden_size=64, partial_observation=None,
+                        return_model=False):
+        """Train a DQN, optionally from partial observations and fixed histories.
+
+        ``architecture="gru"`` consumes the most recent ``history_length``
+        observation tokens. In partial-observation mode each token omits the
+        true automaton state and includes the preceding action, so the network
+        can track recent automaton progress caused by its own epsilon choices.
+        The hidden state is recomputed from this fixed window at each decision;
+        information older than ``history_length`` is not retained.
+        When epsilon commitment determines future epsilon availability from
+        the controller's own actions, the mask follows that observable history.
+        Otherwise unavailable epsilon attempts are no-ops under a global mask.
+        A proven zero-value rejecting sink stops bootstrapping in the replay
+        target only; the sink state is never added to the policy input.
+
+        If ``partial_observation`` is omitted, it is enabled for GRU runs and
+        whenever the MDP has nonzero observation noise. For legacy exact-state
+        linear and MLP runs it defaults to the full product state.
+        """
         import random
         import dqn
         from dqn import Transition
@@ -376,19 +545,50 @@ class ControlSynthesis:
         K = K if K else 100000
         update_every = 4
         n_actions = self.shape[-1]
-        if architecture == "mlp":
-            # Encode product-state components in separate one-hot blocks.
-            n_observations = sum(self.shape[:-1])
-            hidden_size = 64
-        elif architecture == "linear":
-            # A one-hot state index gives every product-state/action pair an
-            # independent learned value; this isolates approximation sharing.
-            n_observations = int(np.prod(self.shape[:-1]))
+        if architecture not in ("linear", "mlp", "gru"):
+            raise ValueError("architecture must be 'linear', 'mlp', or 'gru'")
+        if history_length <= 0:
+            raise ValueError("history_length must be positive")
+        if partial_observation is None:
+            # A noisy MDP observation or recurrent policy must not receive the
+            # true automaton state. Preserve legacy fully-observed baselines
+            # when the MDP observation channel is exact.
+            partial_observation = (
+                architecture == "gru" or self.mdp.observation_error > 0.0
+            )
+        partial_observation = bool(partial_observation)
+        observation_factors = (
+            (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
+            if partial_observation else self.shape[:-1]
+        )
+        if architecture == "linear":
+            # One independent output vector for each observation, or each
+            # product state in the legacy fully-observed baseline.
+            n_observations = int(np.prod(observation_factors))
             hidden_size = None
+        elif architecture == "mlp":
+            n_observations = sum(observation_factors)
+            hidden_size = 64
         else:
-            raise ValueError("architecture must be 'mlp' or 'linear'")
-        policy_net = dqn.DQN(n_observations, n_actions, hidden_size=hidden_size).to(device)
-        target_net = dqn.DQN(n_observations, n_actions, hidden_size=hidden_size).to(device)
+            # GRU tokens contain the current observation, a valid-token bit,
+            # and the preceding action. The history encoder adds a persistent
+            # one-hot epsilon-target memory derived from the controller's own
+            # selected edge, so branch identity survives beyond the k-step window.
+            recurrent_token_size = sum(observation_factors) + 1 + n_actions
+            epsilon_commitment_size = self.oa.shape[1]
+            n_observations = recurrent_token_size + epsilon_commitment_size
+            hidden_size = gru_hidden_size
+
+        def new_network():
+            if architecture == "gru":
+                return dqn.GRUDQN(
+                    n_observations, n_actions, hidden_size=gru_hidden_size
+                ).to(device)
+            return dqn.DQN(n_observations, n_actions,
+                           hidden_size=hidden_size).to(device)
+
+        policy_net = new_network()
+        target_net = new_network()
         target_net.load_state_dict(policy_net.state_dict())
         target_net.eval()
         for parameter in target_net.parameters():
@@ -410,35 +610,127 @@ class ControlSynthesis:
                 for status in statuses
             )
         }
+        epsilon_sources = {
+            q for q, outgoing in enumerate(self.oa.eps) if outgoing
+        }
+        epsilon_targets = {
+            destination
+            for outgoing in self.oa.eps
+            for destination in outgoing
+        }
+        # For the safe-absorbing-states automaton, epsilon is available only
+        # from q0, its targets have no further epsilon edges, and every
+        # non-epsilon q0 transition either stays in q0 or reaches the rejecting
+        # sink. The controller can therefore know epsilon availability from
+        # its own action history without observing hidden q.
+        epsilon_commit_mask_supported = (
+            partial_observation
+            and architecture == "gru"
+            and bool(epsilon_targets)
+            and epsilon_sources == {self.oa.q0}
+            and all(not self.oa.eps[q] for q in epsilon_targets)
+            and all(
+                destination == self.oa.q0 or destination in rejecting_sink_qs
+                for destination in self.oa.delta[self.oa.q0].values()
+            )
+        )
         optimizer = optim.AdamW(policy_net.parameters(), lr=learning_rate,
                                  amsgrad=True, weight_decay=0.0)
         memory = dqn.ReplayMemory(replay_capacity)
         criterion = nn.SmoothL1Loss()
 
-        def encode(s):
-            encoded = torch.zeros((1, n_observations),
-                                  dtype=torch.float32, device=device)
-            if architecture == "linear":
-                index = np.ravel_multi_index(tuple(map(int, s)), self.shape[:-1])
-                encoded[0, index] = 1.0
+        def encode_state(s, *, error_prob=None, previous_action=None):
+            if partial_observation:
+                observation = self.observe_observation(s, error_prob)
             else:
+                observation = self.observe_state(s, error_prob)
+            if architecture == "linear":
+                index = np.ravel_multi_index(tuple(map(int, observation)),
+                                             observation_factors)
+                encoded = torch.zeros(n_observations, dtype=torch.float32,
+                                      device=device)
+                encoded[index] = 1.0
+            elif architecture == "gru":
+                encoded = self.encode_observation(
+                    observation,
+                    partial_observation=partial_observation,
+                    previous_action=previous_action,
+                    recurrent=True,
+                ).to(device)
+            else:
+                encoded = torch.zeros(n_observations, dtype=torch.float32,
+                                      device=device)
                 offset = 0
-                for coordinate, size in zip(s, self.shape[:-1]):
-                    encoded[0, offset + int(coordinate)] = 1.0
+                for coordinate, size in zip(observation, observation_factors):
+                    encoded[offset + int(coordinate)] = 1.0
                     offset += size
-            return encoded
+            return encoded.reshape(1, -1)
 
-        def observed_encoding(s):
-            return encoded_states[self.observe_state(s)]
+        def observed_encoding(s, previous_action=None):
+            return encode_state(s, previous_action=previous_action)
 
-        # These state and action encodings are immutable during training, so
-        # build them once instead of allocating device tensors on every step.
-        encoded_states = {state: encode(state) for state in self.states()}
+        def history_encoding(tokens, *, epsilon_target=None):
+            """Pad tokens and append persistent epsilon-target memory."""
+            tokens = list(tokens[-history_length:])
+            if len(tokens) < history_length:
+                padding = [torch.zeros(recurrent_token_size, dtype=torch.float32,
+                                       device=device)
+                           for _ in range(history_length - len(tokens))]
+                tokens = padding + tokens
+            encoded_history = torch.stack(tokens)
+            valid_token_index = sum(observation_factors)
+            valid_tokens = encoded_history[:, valid_token_index:valid_token_index + 1]
+            target_features = torch.zeros(
+                epsilon_commitment_size, dtype=torch.float32, device=device
+            )
+            if epsilon_target is not None:
+                target_features[int(epsilon_target)] = 1.0
+            commitment = valid_tokens * target_features.unsqueeze(0)
+            encoded_history = torch.cat((encoded_history, commitment), dim=1)
+            return encoded_history.unsqueeze(0)
+
+        def observed_token(s, previous_action=None, *, error_prob=None):
+            return encode_state(
+                s, error_prob=error_prob, previous_action=previous_action
+            ).squeeze(0)
+
+        # For feed-forward networks, cache canonical (noise-free) encodings.
+        # A recurrent policy instead builds a fresh history window per step.
+        if architecture != "gru":
+            encoded_states = {
+                state: encode_state(state, error_prob=0.0)
+                for state in self.states()
+            }
+
+        # The fallback action set is global, so it cannot reveal hidden q.
+        # Some automata also permit a tighter mask derived only from the
+        # controller's own epsilon-commitment history.
+        global_epsilon_actions = sorted({
+            len(self.mdp.A) + destination
+            for outgoing in self.oa.eps
+            for destination in outgoing
+        })
+        global_action_ids = list(range(len(self.mdp.A))) + global_epsilon_actions
+        global_action_mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
+        global_action_mask[global_action_ids] = True
+        mdp_action_ids = list(range(len(self.mdp.A)))
+        mdp_action_mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
+        mdp_action_mask[mdp_action_ids] = True
         action_masks = {}
         for state in self.states():
-            mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
-            mask[self.A[state]] = True
-            action_masks[state] = mask
+            if partial_observation:
+                action_masks[state] = global_action_mask
+            else:
+                mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
+                mask[self.A[state]] = True
+                action_masks[state] = mask
+
+        def get_action_mask(state, epsilon_committed=False):
+            if not partial_observation:
+                return action_masks[state]
+            if epsilon_commit_mask_supported and epsilon_committed:
+                return mdp_action_mask
+            return global_action_mask
         action_tensors = [torch.tensor([[action]], dtype=torch.long, device=device)
                           for action in range(n_actions)]
         reward_tensors = {
@@ -499,11 +791,29 @@ class ControlSynthesis:
         run_started_perf = time.perf_counter()
         for k in range(K):
             if k % log_every == 0:
-                print(f"Episode {k}/{K}")
+                if episode_returns:
+                    return_window = min(1000, len(episode_returns))
+                    recent_return = float(
+                        np.mean(episode_returns[-return_window:])
+                    )
+                    print(
+                        f"Episode {k}/{K}; trailing {return_window}-episode "
+                        f"return={recent_return:.6f}"
+                    )
+                else:
+                    print(f"Episode {k}/{K}")
             mdp_start = (start if start is not None else
                          start_states[np.random.randint(len(start_states))])
             state = (self.shape[0]-1, self.oa.q0) + mdp_start
-            st = observed_encoding(state)
+            epsilon_committed = False
+            epsilon_target = None
+            if architecture == "gru":
+                history_tokens = [observed_token(state)]
+                st = history_encoding(
+                    history_tokens, epsilon_target=epsilon_target
+                )
+            else:
+                st = observed_encoding(state)
             # The paper anneals epsilon from 1.0 to 0.1. The separate
             # automaton-action probability improves coverage of legal
             # epsilon branches while leaving replay sampling uniform.
@@ -514,8 +824,14 @@ class ControlSynthesis:
             episode_return = 0.0
             return_discount = 1.0
             for t in range(T):
-                legal = self.A[state]
-                automaton_actions = [a for a in legal if a >= len(self.mdp.A)]
+                current_action_mask = get_action_mask(state, epsilon_committed)
+                legal = [
+                    action for action in range(n_actions)
+                    if current_action_mask[action]
+                ]
+                automaton_actions = [
+                    action for action in legal if action >= len(self.mdp.A)
+                ]
                 if (automaton_actions
                         and random.random() < automaton_action_probability):
                     action = random.choice(automaton_actions)
@@ -524,19 +840,50 @@ class ControlSynthesis:
                 else:
                     with torch.no_grad():
                         v = policy_net(st).squeeze(0)
-                        v = v.masked_fill(~action_masks[state], -torch.inf)
+                        v = v.masked_fill(~current_action_mask, -torch.inf)
                     action = int(v.argmax().item())
                 transition_counts[state + (action,)] += 1
-                states, probs = self.transition_probs[state][action]
+                if action in self.A[state]:
+                    states, probs = self.transition_probs[state][action]
+                elif partial_observation and action in global_epsilon_actions:
+                    # The controller cannot know whether an epsilon edge is
+                    # enabled. An unavailable attempt is a no-op, keeping a
+                    # fixed observation-independent action set.
+                    states, probs = [state], [1.0]
+                else:
+                    raise RuntimeError(f"Action {action} is invalid in state {state}")
                 next_state = states[np.random.choice(len(states), p=probs)]
-                next_st = observed_encoding(next_state)
+                next_epsilon_committed = (
+                    epsilon_committed or action in global_epsilon_actions
+                )
+                next_epsilon_target = epsilon_target
+                if action in global_epsilon_actions and next_epsilon_target is None:
+                    next_epsilon_target = action - len(self.mdp.A)
+                if architecture == "gru":
+                    next_token = observed_token(next_state, previous_action=action)
+                    next_history_tokens = (
+                        history_tokens + [next_token]
+                    )[-history_length:]
+                    next_st = history_encoding(
+                        next_history_tokens,
+                        epsilon_target=next_epsilon_target,
+                    )
+                else:
+                    next_st = observed_encoding(next_state)
+                    next_history_tokens = None
+                # A proven zero-value sink can terminate the Bellman target
+                # without exposing q in the policy input or action mask. The
+                # simulator rollout itself continues unchanged.
                 next_is_rejecting_sink = next_state[1] in rejecting_sink_qs
                 reward = float(self.reward[state])
                 # Use None only in the replay target for a proven zero-value
                 # sink. The rollout itself continues so this changes no reward
                 # semantics or accepting-state behavior.
                 replay_next_st = None if next_is_rejecting_sink else next_st
-                next_mask = None if next_is_rejecting_sink else action_masks[next_state]
+                next_mask = (
+                    None if next_is_rejecting_sink
+                    else get_action_mask(next_state, next_epsilon_committed)
+                )
                 # Match tabular Q-learning: fixed horizon, but bootstrap on every step.
                 # Use the same reward-conditioned discount as tabular Q-learning.
                 transition_discount = (self.discount_accepting if reward
@@ -555,6 +902,10 @@ class ControlSynthesis:
                     )
                 state = next_state
                 st = next_st
+                if architecture == "gru":
+                    history_tokens = next_history_tokens
+                epsilon_committed = next_epsilon_committed
+                epsilon_target = next_epsilon_target
                 total_steps += 1
                 if total_steps % update_every == 0:
                     optimize_model()
@@ -562,33 +913,59 @@ class ControlSynthesis:
                     target_net.load_state_dict(policy_net.state_dict())
             episode_returns.append(episode_return)
 
-        if 'plt' in globals():
-            fig, ax = plt.subplots(figsize=(8, 4))
-            episodes = np.arange(1, len(episode_returns) + 1)
-            ax.plot(episodes, episode_returns, alpha=0.25, label='Episode return')
-            window = min(50, len(episode_returns))
-            if window > 1:
-                moving_average = np.convolve(
-                    episode_returns, np.ones(window) / window, mode='valid')
-                ax.plot(episodes[window - 1:], moving_average,
-                        label=f'{window}-episode average')
-            ax.set_xlabel('Episode')
-            ax.set_ylabel('Return')
-            ax.set_title('DQN training return')
-            ax.grid(alpha=0.25)
-            ax.legend()
-            fig.tight_layout()
-            plt.show()
+        # Keep returns available for notebook inspection without opening a
+        # plotting window. A compact text summary is useful during long runs;
+        # the full per-episode series is also included in saved checkpoints.
+        self.last_episode_returns = np.asarray(episode_returns, dtype=np.float64)
+        if self.last_episode_returns.size:
+            summary_window = min(1000, self.last_episode_returns.size)
+            self.last_training_return_summary = {
+                "episodes": int(self.last_episode_returns.size),
+                "mean": float(self.last_episode_returns.mean()),
+                "std": float(self.last_episode_returns.std()),
+                "first_window_mean": float(
+                    self.last_episode_returns[:summary_window].mean()
+                ),
+                "last_window_mean": float(
+                    self.last_episode_returns[-summary_window:].mean()
+                ),
+                "window_episodes": int(summary_window),
+            }
+            print(
+                "Training returns: "
+                f"mean={self.last_training_return_summary['mean']:.6f}, "
+                f"first {summary_window} mean="
+                f"{self.last_training_return_summary['first_window_mean']:.6f}, "
+                f"last {summary_window} mean="
+                f"{self.last_training_return_summary['last_window_mean']:.6f}"
+            )
+        else:
+            self.last_training_return_summary = {
+                "episodes": 0,
+                "mean": None,
+                "std": None,
+                "first_window_mean": None,
+                "last_window_mean": None,
+                "window_episodes": 0,
+            }
 
         Q = np.full(self.shape, -np.inf, dtype=np.float32)
         with torch.no_grad():
             for state in self.states():
-                # Keep the returned table deterministic. During training the
-                # network receives noisy observations; the public Q-table is
-                # indexed by the corresponding clean product state.
-                Q[state] = policy_net(encoded_states[state]).squeeze(0).cpu().numpy()
-                Q[state][list(set(range(n_actions)) - set(self.A[state]))] = -np.inf
-                if state[1] in rejecting_sink_qs:
+                # A recurrent Q value depends on history. The table returned
+                # here uses a cold-start history containing only this clean
+                # current observation; use the returned model for live policy
+                # decisions with the actual observation history.
+                if architecture == "gru":
+                    token = observed_token(state, error_prob=0.0)
+                    network_input = history_encoding([token])
+                else:
+                    network_input = encoded_states[state]
+                Q[state] = policy_net(network_input).squeeze(0).cpu().numpy()
+                valid_actions = (global_action_ids if partial_observation
+                                 else self.A[state])
+                Q[state][list(set(range(n_actions)) - set(valid_actions))] = -np.inf
+                if not partial_observation and state[1] in rejecting_sink_qs:
                     Q[state][self.A[state]] = 0.0
 
         if checkpoint_dir is not None:
@@ -636,6 +1013,7 @@ class ControlSynthesis:
                 "episodes": int(K),
                 "steps_per_episode": int(T),
                 "environment_steps": int(total_steps),
+                "training_return_summary": self.last_training_return_summary,
                 "start_mdp_square": list(map(int, start)) if start is not None else None,
                 "start_sampling": (
                     "uniform over grid states" if start is None else "fixed square"
@@ -648,6 +1026,38 @@ class ControlSynthesis:
                 "n_observations": int(n_observations),
                 "n_actions": int(n_actions),
                 "hidden_size": hidden_size,
+                "partial_observation": partial_observation,
+                "observation_encoding": (
+                    "pair,row,column; automaton state hidden"
+                    if partial_observation else
+                    "pair,automaton state,row,column"
+                ),
+                "history_length": int(history_length) if architecture == "gru" else None,
+                "gru_hidden_size": int(gru_hidden_size) if architecture == "gru" else None,
+                "recurrent_token_includes_previous_action": architecture == "gru",
+                "recurrent_input_includes_epsilon_commitment": architecture == "gru",
+                "recurrent_epsilon_commitment_mode": (
+                    "target_one_hot" if architecture == "gru" else "none"
+                ),
+                "recurrent_epsilon_commitment_size": (
+                    int(epsilon_commitment_size) if architecture == "gru" else 0
+                ),
+                "observation_error": float(self.mdp.observation_error),
+                "recurrent_padding": "left zero padding with valid-token bit",
+                "partial_action_semantics": (
+                    "grid moves plus epsilon edges until an observed epsilon commitment; then grid moves only"
+                    if epsilon_commit_mask_supported else
+                    "all grid moves and epsilon edges; unavailable epsilon is no-op"
+                    if partial_observation else None
+                ),
+                "epsilon_commit_mask_from_history": epsilon_commit_mask_supported,
+                "rejecting_sink_target_semantics": (
+                    "zero bootstrap on proven rejecting-sink transitions; hidden q is not a policy input"
+                ),
+                "q_table_semantics": (
+                    "cold-start history with one clean current observation"
+                    if architecture == "gru" else None
+                ),
                 "replay_capacity": int(replay_capacity),
                 "batch_size": int(batch_size),
                 "update_every": int(update_every),
@@ -658,6 +1068,7 @@ class ControlSynthesis:
                 "mdp_shape": list(map(int, self.mdp.shape)),
                 "automaton_shape": list(map(int, self.oa.shape)),
                 "automaton_initial_state": int(self.oa.q0),
+                "gru_num_layers": 1 if architecture == "gru" else None,
                 "git_commit": git_commit,
                 "git_dirty_files": dirty_files,
                 "source_sha256": source_hashes,
@@ -676,6 +1087,9 @@ class ControlSynthesis:
                 },
                 "optimizer_state_dict": optimizer.state_dict(),
                 "q_values": torch.from_numpy(Q.copy()),
+                "episode_returns": torch.from_numpy(
+                    self.last_episode_returns.copy()
+                ),
             }
             torch.save(checkpoint, checkpoint_tmp)
             os.replace(checkpoint_tmp, checkpoint_path)
@@ -690,5 +1104,9 @@ class ControlSynthesis:
             self.last_checkpoint_path = str(checkpoint_path)
             print(f"Saved DQN checkpoint: {checkpoint_path}")
         if return_diagnostics:
+            if return_model:
+                return Q, transition_counts, policy_net
             return Q, transition_counts
+        if return_model:
+            return Q, policy_net
         return Q

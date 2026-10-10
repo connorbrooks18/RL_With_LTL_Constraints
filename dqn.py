@@ -70,3 +70,48 @@ class DQN(nn.Module):
         x = F.relu(self.layer1(x))
         x = F.relu(self.layer2(x))
         return self.layer3(x)
+
+
+class GRUDQN(nn.Module):
+    """DQN head over a fixed window of observation feature vectors.
+
+    Inputs have shape ``(batch, history_length, n_observations)``. The GRU
+    summarizes each history and the linear head returns one Q value per action.
+    """
+
+    def __init__(self, n_observations, n_actions, hidden_size=64,
+                 num_layers=1):
+        super().__init__()
+        if n_observations <= 0 or n_actions <= 0 or hidden_size <= 0:
+            raise ValueError("Network dimensions must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        self.n_observations = n_observations
+        self.n_actions = n_actions
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.gru = nn.GRU(
+            input_size=n_observations,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.q_head = nn.Linear(hidden_size, n_actions)
+        nn.init.zeros_(self.q_head.weight)
+        nn.init.zeros_(self.q_head.bias)
+
+    def forward(self, x):
+        if x.ndim == 2:
+            # Treat a single (time, feature) sequence as a batch of one.
+            x = x.unsqueeze(0)
+        if x.ndim != 3:
+            raise ValueError(
+                "GRUDQN expects (batch, history, features) or (history, features)"
+            )
+        if x.shape[-1] != self.n_observations:
+            raise ValueError(
+                f"Expected {self.n_observations} observation features, "
+                f"got {x.shape[-1]}"
+            )
+        _, hidden = self.gru(x)
+        return self.q_head(hidden[-1])

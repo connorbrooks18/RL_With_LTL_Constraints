@@ -2,3 +2,4 @@ venv/
 __pycache__/
 checkpoints/
 .gitignore
+checkpoints_pomdp/

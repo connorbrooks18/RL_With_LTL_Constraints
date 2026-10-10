@@ -88,8 +88,10 @@ class GridMDP():
         self.reward = reward if reward is not None else np.zeros((n_rows,n_cols))
         self.label = label if label is not None else np.empty(shape,dtype=object); self.label.fill(()) if label is None else None
         
-        self.p = p    # 80% probability goes to the right direction, 10% prob each goes to two sides 
+        self.p = p    # 80% probability goes to the right direction, 10% prob each goes to two sides
         self.A = A
+        if not 0.0 <= observation_error <= 1.0:
+            raise ValueError("observation_error must be between 0 and 1")
         self.observation_error = observation_error
         
         # Create the transition matrix
@@ -103,8 +105,16 @@ class GridMDP():
         self.lcmap = lcmap
 
     def observe_state(self, state, error_prob=None):
-        """Return a noisy observation without changing the true MDP state."""
+        """Return a noisy position observation without changing the true state.
+
+        With probability ``error_prob``, the sensor reports a uniformly
+        selected in-bounds, non-obstacle neighboring cell. Otherwise it
+        reports the true position. The transition state itself is never
+        modified by this observation process.
+        """
         error_prob = self.observation_error if error_prob is None else error_prob
+        if not 0.0 <= error_prob <= 1.0:
+            raise ValueError("error_prob must be between 0 and 1")
         if np.random.random() >= error_prob:
             return state
 
