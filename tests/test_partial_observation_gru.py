@@ -37,6 +37,17 @@ def make_system(observation_error=0.0):
 
 
 class ObservationTests(unittest.TestCase):
+    def test_training_start_states_exclude_obstacles_but_keep_traps(self):
+        mdp, _oa, csrl = make_system()
+        starts = csrl.start_states()
+
+        self.assertEqual(len(starts), 19)
+        self.assertTrue(all(mdp.structure[state] != "B" for state in starts))
+        self.assertIn((1, 3), starts)  # labeled b trap
+        self.assertIn((3, 0), starts)  # labeled b trap
+        self.assertIn((3, 2), starts)  # labeled a trap
+        self.assertNotIn((2, 0), starts)  # blocked square
+
     def test_noisy_sensor_reports_neighbor_without_changing_environment(self):
         mdp = GridMDP((3, 3), observation_error=1.0)
         state = (1, 1)
@@ -108,6 +119,13 @@ class GRUDQNTests(unittest.TestCase):
             self.assertEqual(metadata["architecture"], "gru")
             self.assertEqual(metadata["history_length"], 3)
             self.assertTrue(metadata["partial_observation"])
+            if metadata["git_dirty_files"] is not None:
+                self.assertNotIn("ontrolsyn.py", metadata["git_dirty_files"])
+                self.assertIn("controlsyn.py", metadata["git_dirty_files"])
+            self.assertEqual(
+                metadata["start_sampling"],
+                "uniform over traversable grid states",
+            )
             self.assertTrue(metadata["epsilon_commit_mask_from_history"])
             self.assertTrue(metadata["recurrent_input_includes_epsilon_commitment"])
             self.assertEqual(metadata["training_return_summary"]["episodes"], 3)

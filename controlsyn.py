@@ -116,12 +116,13 @@ class ControlSynthesis:
         return (np.random.randint(n_mdps),np.random.randint(n_qs)) + mdp_state
 
     def start_states(self):
-        """Return every grid cell as an eligible episode start.
+        """Return traversable grid cells as eligible episode starts.
 
-        This matches GridMDP.random_state: all cells are sampled uniformly,
-        including proposition-labeled and blocked cells.
+        Proposition-labeled and trap cells are valid starts; obstacle cells
+        are not MDP states and must not be sampled as episode starts.
         """
-        return list(self.mdp.states())
+        return [state for state in self.mdp.states()
+                if self.mdp.structure[state] != "B"]
 
     def observe_state(self, state, error_prob=None):
         """Return a noisy product-state observation, retaining automaton q.
@@ -987,9 +988,25 @@ class ControlSynthesis:
                     return None
 
             git_commit = git_output("rev-parse", "HEAD")
-            git_status = git_output("status", "--porcelain", "--untracked-files=all")
+            try:
+                # Porcelain `-z` keeps leading status columns and does not quote
+                # paths that contain spaces. `git_output(...).strip()` would
+                # remove the first path's leading status space and truncate its
+                # name when applying the usual three-column prefix.
+                git_status = subprocess.check_output(
+                    ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+                    cwd=project_dir,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.CalledProcessError):
+                git_status = None
             dirty_files = (
-                [line[3:] for line in git_status.splitlines() if line]
+                [
+                    record[3:]
+                    for record in git_status.split("\0")
+                    if len(record) >= 4 and record[2] == " "
+                ]
                 if git_status is not None else None
             )
             source_hashes = {}
@@ -1016,7 +1033,8 @@ class ControlSynthesis:
                 "training_return_summary": self.last_training_return_summary,
                 "start_mdp_square": list(map(int, start)) if start is not None else None,
                 "start_sampling": (
-                    "uniform over grid states" if start is None else "fixed square"
+                    "uniform over traversable grid states" if start is None
+                    else "fixed square"
                 ),
                 "epsilon_schedule": "linear from 1.0 to epsilon_floor",
                 "epsilon_floor": float(epsilon_floor),
