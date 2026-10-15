@@ -506,7 +506,8 @@ class ControlSynthesis:
             interact(plot_value,i=i,q=q)
 
     def deep_q_learning(self, start=None, T=None, K=None, *,
-                        epsilon_floor=0.1, learning_rate=1e-4,
+                        epsilon_floor=0.1, epsilon_decay_fraction=1.0,
+                        learning_rate=1e-4,
                         automaton_action_probability=0.2,
                         return_diagnostics=False, architecture="linear",
                         replay_capacity=100_000, batch_size=128,
@@ -544,6 +545,10 @@ class ControlSynthesis:
         # continue to accrue accepting rewards and must not be marked done.
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
+        epsilon_decay_fraction = float(epsilon_decay_fraction)
+        if not 0.0 < epsilon_decay_fraction <= 1.0:
+            raise ValueError("epsilon_decay_fraction must be in (0, 1]")
+        epsilon_decay_episodes = max(1, int(np.ceil(K * epsilon_decay_fraction)))
         update_every = 4
         n_actions = self.shape[-1]
         if architecture not in ("linear", "mlp", "gru"):
@@ -819,7 +824,8 @@ class ControlSynthesis:
             # automaton-action probability improves coverage of legal
             # epsilon branches while leaving replay sampling uniform.
             epsilon = max(
-                1.0 - (1.0 - epsilon_floor) * k / max(1, K - 1),
+                1.0 - (1.0 - epsilon_floor) * k
+                / max(1, epsilon_decay_episodes - 1),
                 epsilon_floor,
             )
             episode_return = 0.0
@@ -1036,7 +1042,11 @@ class ControlSynthesis:
                     "uniform over traversable grid states" if start is None
                     else "fixed square"
                 ),
-                "epsilon_schedule": "linear from 1.0 to epsilon_floor",
+                "epsilon_schedule": (
+                    "linear from 1.0 to epsilon_floor over "
+                    f"{epsilon_decay_fraction:.6g} of episodes, then floor"
+                ),
+                "epsilon_decay_fraction": epsilon_decay_fraction,
                 "epsilon_floor": float(epsilon_floor),
                 "learning_rate": float(learning_rate),
                 "automaton_action_probability": float(automaton_action_probability),
