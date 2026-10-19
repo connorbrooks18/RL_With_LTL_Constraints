@@ -507,6 +507,7 @@ class ControlSynthesis:
 
     def deep_q_learning(self, start=None, T=None, K=None, *,
                         epsilon_floor=0.1, epsilon_decay_fraction=1.0,
+                        seed=None,
                         learning_rate=1e-4,
                         automaton_action_probability=0.2,
                         return_diagnostics=False, architecture="linear",
@@ -545,6 +546,11 @@ class ControlSynthesis:
         # continue to accrue accepting rewards and must not be marked done.
         T = T if T else int(np.prod(self.shape[:-1]))
         K = K if K else 100000
+        if seed is not None:
+            seed = int(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
         epsilon_decay_fraction = float(epsilon_decay_fraction)
         if not 0.0 < epsilon_decay_fraction <= 1.0:
             raise ValueError("epsilon_decay_fraction must be in (0, 1]")
@@ -1036,6 +1042,7 @@ class ControlSynthesis:
                 "episodes": int(K),
                 "steps_per_episode": int(T),
                 "environment_steps": int(total_steps),
+                "seed": seed,
                 "training_return_summary": self.last_training_return_summary,
                 "start_mdp_square": list(map(int, start)) if start is not None else None,
                 "start_sampling": (
