@@ -3,3 +3,5 @@ __pycache__/
 checkpoints/
 .gitignore
 checkpoints_pomdp/
+artifacts/
+checkpoints_pomdp_history1/
