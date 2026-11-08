@@ -5,3 +5,9 @@ checkpoints/
 checkpoints_pomdp/
 artifacts/
 checkpoints_pomdp_history1/
+checkpoints_pomdp_history4/
+checkpoints_pomdp_history4_seed*/
+checkpoints_pomdp_mlp_seed*/
+checkpoints_office_history4_seed*/
+checkpoints_gru_freeze_ab/
+logs/

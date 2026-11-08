@@ -515,7 +515,9 @@ class ControlSynthesis:
                         target_update_every=250,
                         checkpoint_dir="checkpoints", history_length=5,
                         gru_hidden_size=64, partial_observation=None,
-                        return_model=False):
+                        return_model=False, metadata_extra=None,
+                        freeze_gru_after_episodes=None,
+                        additional_checkpoint_episodes=None):
         """Train a DQN, optionally from partial observations and fixed histories.
 
         ``architecture="gru"`` consumes the most recent ``history_length``
@@ -559,6 +561,19 @@ class ControlSynthesis:
         n_actions = self.shape[-1]
         if architecture not in ("linear", "mlp", "gru"):
             raise ValueError("architecture must be 'linear', 'mlp', or 'gru'")
+        if freeze_gru_after_episodes is not None:
+            freeze_gru_after_episodes = int(freeze_gru_after_episodes)
+            if architecture != "gru":
+                raise ValueError("GRU freezing is only available for architecture='gru'")
+            if not 0 < freeze_gru_after_episodes < K:
+                raise ValueError(
+                    "freeze_gru_after_episodes must be between 1 and K-1"
+                )
+        additional_checkpoint_episodes = set(
+            int(episode) for episode in (additional_checkpoint_episodes or ())
+        )
+        if any(not 0 < episode < K for episode in additional_checkpoint_episodes):
+            raise ValueError("Additional checkpoint episodes must be between 1 and K-1")
         if history_length <= 0:
             raise ValueError("history_length must be positive")
         if partial_observation is None:
@@ -801,6 +816,10 @@ class ControlSynthesis:
         import time
         run_started_at = datetime.now(timezone.utc)
         run_started_perf = time.perf_counter()
+        gru_frozen = False
+        freeze_snapshot = None
+        progress_snapshots = []
+        joint_phase_seconds = None
         for k in range(K):
             if k % log_every == 0:
                 if episode_returns:
@@ -923,8 +942,70 @@ class ControlSynthesis:
                 if total_steps % update_every == 0:
                     optimize_model()
                 if total_steps % target_update_every == 0:
-                    target_net.load_state_dict(policy_net.state_dict())
+                    if gru_frozen:
+                        target_net.q_head.load_state_dict(
+                            policy_net.q_head.state_dict()
+                        )
+                    else:
+                        target_net.load_state_dict(policy_net.state_dict())
             episode_returns.append(episode_return)
+            if (freeze_gru_after_episodes is not None
+                    and not gru_frozen
+                    and k + 1 == freeze_gru_after_episodes):
+                freeze_time = datetime.now(timezone.utc)
+                joint_phase_seconds = time.perf_counter() - run_started_perf
+                freeze_snapshot = {
+                    "finished_at_utc": freeze_time.isoformat(),
+                    "elapsed_seconds": joint_phase_seconds,
+                    "policy_state_dict": {
+                        key: value.detach().cpu().clone()
+                        for key, value in policy_net.state_dict().items()
+                    },
+                    "target_state_dict": {
+                        key: value.detach().cpu().clone()
+                        for key, value in target_net.state_dict().items()
+                    },
+                    "episode_returns": np.asarray(
+                        episode_returns, dtype=np.float64
+                    ).copy(),
+                }
+                # The target GRU is synchronized at the phase boundary. It
+                # remains fixed while only the target Q head follows updates.
+                target_net.gru.load_state_dict(policy_net.gru.state_dict())
+                policy_net.gru.requires_grad_(False)
+                gru_frozen = True
+                print(
+                    f"Frozen GRU after episode {k + 1}; "
+                    f"continuing with {sum(p.numel() for p in policy_net.q_head.parameters() if p.requires_grad):,} "
+                    "trainable Q-head parameters",
+                    flush=True,
+                )
+            if k + 1 in additional_checkpoint_episodes:
+                snapshot_time = datetime.now(timezone.utc)
+                snapshot_elapsed = time.perf_counter() - run_started_perf
+                progress_snapshots.append({
+                    "episodes": k + 1,
+                    "finished_at_utc": snapshot_time.isoformat(),
+                    "elapsed_seconds": snapshot_elapsed,
+                    "gru_frozen": gru_frozen,
+                    "policy_state_dict": {
+                        key: value.detach().cpu().clone()
+                        for key, value in policy_net.state_dict().items()
+                    },
+                    "target_state_dict": {
+                        key: value.detach().cpu().clone()
+                        for key, value in target_net.state_dict().items()
+                    },
+                    "episode_returns": np.asarray(
+                        episode_returns, dtype=np.float64
+                    ).copy(),
+                })
+
+        training_loop_seconds = time.perf_counter() - run_started_perf
+        head_only_phase_seconds = (
+            training_loop_seconds - joint_phase_seconds
+            if gru_frozen else None
+        )
 
         # Keep returns available for notebook inspection without opening a
         # plotting window. A compact text summary is useful during long runs;
@@ -1044,6 +1125,23 @@ class ControlSynthesis:
                 "environment_steps": int(total_steps),
                 "seed": seed,
                 "training_return_summary": self.last_training_return_summary,
+                "training_loop_seconds": training_loop_seconds,
+                "freeze_gru_after_episodes": freeze_gru_after_episodes,
+                "gru_frozen_at_end": bool(gru_frozen),
+                "joint_gru_head_training_seconds": joint_phase_seconds,
+                "head_only_training_seconds": head_only_phase_seconds,
+                "gru_parameter_count": (
+                    int(sum(p.numel() for p in policy_net.gru.parameters()))
+                    if architecture == "gru" else None
+                ),
+                "q_head_parameter_count": (
+                    int(sum(p.numel() for p in policy_net.q_head.parameters()))
+                    if architecture == "gru" else None
+                ),
+                "training_phase": (
+                    "head_only_after_frozen_gru" if gru_frozen
+                    else "joint_gru_and_q_head"
+                ),
                 "start_mdp_square": list(map(int, start)) if start is not None else None,
                 "start_sampling": (
                     "uniform over traversable grid states" if start is None
@@ -1108,6 +1206,8 @@ class ControlSynthesis:
                 "git_dirty_files": dirty_files,
                 "source_sha256": source_hashes,
             }
+            if metadata_extra:
+                metadata.update(metadata_extra)
             checkpoint_path = checkpoint_root / f"dqn_{run_id}.pt"
             checkpoint_tmp = checkpoint_path.with_suffix(".pt.tmp")
             checkpoint = {
@@ -1138,6 +1238,121 @@ class ControlSynthesis:
             os.replace(metadata_tmp, metadata_path)
             self.last_checkpoint_path = str(checkpoint_path)
             print(f"Saved DQN checkpoint: {checkpoint_path}")
+            if freeze_snapshot is not None:
+                snapshot_metadata = dict(metadata)
+                snapshot_run_id = (
+                    f"{timestamp}_K{freeze_gru_after_episodes}_T{T}_"
+                    f"{commit_tag}_pre_freeze"
+                )
+                snapshot_metadata.update({
+                    "run_id": snapshot_run_id,
+                    "finished_at_utc": freeze_snapshot["finished_at_utc"],
+                    "elapsed_seconds": freeze_snapshot["elapsed_seconds"],
+                    "episodes": int(freeze_gru_after_episodes),
+                    "environment_steps": int(freeze_gru_after_episodes * T),
+                    "training_return_summary": {
+                        "episodes": int(freeze_gru_after_episodes),
+                        "mean": float(freeze_snapshot["episode_returns"].mean()),
+                        "std": float(freeze_snapshot["episode_returns"].std()),
+                        "first_window_mean": float(
+                            freeze_snapshot["episode_returns"][:min(1000, freeze_gru_after_episodes)].mean()
+                        ),
+                        "last_window_mean": float(
+                            freeze_snapshot["episode_returns"][-min(1000, freeze_gru_after_episodes):].mean()
+                        ),
+                        "window_episodes": min(1000, freeze_gru_after_episodes),
+                    },
+                    "training_loop_seconds": freeze_snapshot["elapsed_seconds"],
+                    "gru_frozen_at_end": False,
+                    "joint_gru_head_training_seconds": freeze_snapshot[
+                        "elapsed_seconds"
+                    ],
+                    "head_only_training_seconds": None,
+                    "training_phase": "joint_gru_and_q_head_before_freeze",
+                    "gru_frozen_at_checkpoint": False,
+                    "snapshot_only": True,
+                })
+                snapshot_path = checkpoint_root / f"dqn_{snapshot_run_id}.pt"
+                snapshot_tmp = snapshot_path.with_suffix(".pt.tmp")
+                torch.save({
+                    "metadata": snapshot_metadata,
+                    "policy_state_dict": freeze_snapshot["policy_state_dict"],
+                    "target_state_dict": freeze_snapshot["target_state_dict"],
+                    "episode_returns": torch.from_numpy(
+                        freeze_snapshot["episode_returns"]
+                    ),
+                }, snapshot_tmp)
+                os.replace(snapshot_tmp, snapshot_path)
+                snapshot_metadata_path = snapshot_path.with_suffix(".json")
+                snapshot_metadata_tmp = snapshot_metadata_path.with_suffix(".json.tmp")
+                with snapshot_metadata_tmp.open("w", encoding="utf-8") as metadata_file:
+                    json.dump(snapshot_metadata, metadata_file, indent=2, sort_keys=True)
+                    metadata_file.write("\n")
+                os.replace(snapshot_metadata_tmp, snapshot_metadata_path)
+                self.last_freeze_snapshot_path = str(snapshot_path)
+                print(f"Saved pre-freeze DQN checkpoint: {snapshot_path}")
+            self.last_progress_checkpoint_paths = []
+            for snapshot in progress_snapshots:
+                episode = snapshot["episodes"]
+                suffix = "headonly" if snapshot["gru_frozen"] else "joint"
+                snapshot_run_id = (
+                    f"{timestamp}_K{episode}_T{T}_{commit_tag}_{suffix}"
+                )
+                snapshot_metadata = dict(metadata)
+                prefix_returns = snapshot["episode_returns"]
+                snapshot_metadata.update({
+                    "run_id": snapshot_run_id,
+                    "finished_at_utc": snapshot["finished_at_utc"],
+                    "elapsed_seconds": snapshot["elapsed_seconds"],
+                    "episodes": int(episode),
+                    "environment_steps": int(episode * T),
+                    "training_return_summary": {
+                        "episodes": int(episode),
+                        "mean": float(prefix_returns.mean()),
+                        "std": float(prefix_returns.std()),
+                        "first_window_mean": float(
+                            prefix_returns[:min(1000, episode)].mean()
+                        ),
+                        "last_window_mean": float(
+                            prefix_returns[-min(1000, episode):].mean()
+                        ),
+                        "window_episodes": min(1000, episode),
+                    },
+                    "training_loop_seconds": snapshot["elapsed_seconds"],
+                    "gru_frozen_at_end": bool(snapshot["gru_frozen"]),
+                    "joint_gru_head_training_seconds": (
+                        joint_phase_seconds if snapshot["gru_frozen"]
+                        else snapshot["elapsed_seconds"]
+                    ),
+                    "head_only_training_seconds": (
+                        snapshot["elapsed_seconds"] - joint_phase_seconds
+                        if snapshot["gru_frozen"] else None
+                    ),
+                    "training_phase": (
+                        "head_only_after_frozen_gru" if snapshot["gru_frozen"]
+                        else "joint_gru_and_q_head"
+                    ),
+                    "gru_frozen_at_checkpoint": bool(snapshot["gru_frozen"]),
+                    "snapshot_only": True,
+                    "snapshot_type": "training_progress",
+                })
+                snapshot_path = checkpoint_root / f"dqn_{snapshot_run_id}.pt"
+                snapshot_tmp = snapshot_path.with_suffix(".pt.tmp")
+                torch.save({
+                    "metadata": snapshot_metadata,
+                    "policy_state_dict": snapshot["policy_state_dict"],
+                    "target_state_dict": snapshot["target_state_dict"],
+                    "episode_returns": torch.from_numpy(prefix_returns),
+                }, snapshot_tmp)
+                os.replace(snapshot_tmp, snapshot_path)
+                snapshot_metadata_path = snapshot_path.with_suffix(".json")
+                snapshot_metadata_tmp = snapshot_metadata_path.with_suffix(".json.tmp")
+                with snapshot_metadata_tmp.open("w", encoding="utf-8") as metadata_file:
+                    json.dump(snapshot_metadata, metadata_file, indent=2, sort_keys=True)
+                    metadata_file.write("\n")
+                os.replace(snapshot_metadata_tmp, snapshot_metadata_path)
+                self.last_progress_checkpoint_paths.append(str(snapshot_path))
+                print(f"Saved training-progress checkpoint: {snapshot_path}")
         if return_diagnostics:
             if return_model:
                 return Q, transition_counts, policy_net

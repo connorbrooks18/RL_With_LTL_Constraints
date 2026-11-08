@@ -1,4 +1,8 @@
-"""Run the Safe Absorbing States partial-observation GRU-DQN experiment."""
+"""Run the Safe Absorbing States partial-observation DQN experiment.
+
+Defaults follow the model-free grid-world Task 1 budget in Chapter 4 of Li
+(2024), adapted to this repository's environment.
+"""
 
 from __future__ import annotations
 
@@ -31,12 +35,33 @@ LABEL = np.array([
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--episodes", type=int, default=800_000)
-    parser.add_argument("--horizon", type=int, default=100)
-    parser.add_argument("--history-length", type=int, default=16)
+    parser.add_argument("--episodes", type=int, default=15_000)
+    parser.add_argument("--horizon", type=int, default=600)
+    parser.add_argument("--history-length", type=int, default=4)
+    parser.add_argument(
+        "--architecture", choices=("gru", "mlp"), default="gru",
+        help="gru uses an observation history; mlp is a feedforward no-history baseline",
+    )
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--checkpoint-dir", default="checkpoints_pomdp")
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--replay-capacity", type=int, default=100_000)
+    parser.add_argument("--target-update-every", type=int, default=50)
+    parser.add_argument("--epsilon-floor", type=float, default=0.1)
+    parser.add_argument("--epsilon-decay-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--freeze-gru-after-episodes", type=int,
+        help="freeze the GRU after this many episodes and train only the Q head",
+    )
+    parser.add_argument("--checkpoint-dir")
     args = parser.parse_args()
+    if args.checkpoint_dir is None:
+        if args.architecture == "gru":
+            args.checkpoint_dir = (
+                f"checkpoints_pomdp_history{args.history_length}_seed{args.seed}"
+            )
+        else:
+            args.checkpoint_dir = f"checkpoints_pomdp_mlp_seed{args.seed}"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -59,30 +84,44 @@ def main() -> None:
     print(
         "Starting POMDP GRU-DQN run:",
         f"episodes={args.episodes}, horizon={args.horizon},",
-        f"history={args.history_length}, seed={args.seed}",
+        f"architecture={args.architecture}, history={args.history_length}, seed={args.seed}",
         flush=True,
+    )
+    progress_checkpoints = (
+        range(args.freeze_gru_after_episodes + 2_500, args.episodes, 2_500)
+        if args.freeze_gru_after_episodes is not None else ()
     )
     _q_values, _transition_counts, _policy_net = csrl.deep_q_learning(
         T=args.horizon,
         K=args.episodes,
-        epsilon_floor=0.1,
-        epsilon_decay_fraction=0.25,
+        epsilon_floor=args.epsilon_floor,
+        epsilon_decay_fraction=args.epsilon_decay_fraction,
         seed=args.seed,
-        learning_rate=1e-4,
+        learning_rate=args.learning_rate,
         automaton_action_probability=0.2,
-        architecture="gru",
+        architecture=args.architecture,
         history_length=args.history_length,
         gru_hidden_size=64,
         partial_observation=True,
-        batch_size=128,
-        replay_capacity=100_000,
-        target_update_every=1_000,
+        batch_size=args.batch_size,
+        replay_capacity=args.replay_capacity,
+        target_update_every=args.target_update_every,
         checkpoint_dir=args.checkpoint_dir,
         return_diagnostics=True,
         return_model=True,
+        freeze_gru_after_episodes=args.freeze_gru_after_episodes,
+        additional_checkpoint_episodes=progress_checkpoints,
     )
     print("Training summary:", csrl.last_training_return_summary, flush=True)
     print("Saved checkpoint:", csrl.last_checkpoint_path, flush=True)
+    if args.freeze_gru_after_episodes is not None:
+        print(
+            "Saved pre-freeze checkpoint:",
+            csrl.last_freeze_snapshot_path,
+            flush=True,
+        )
+        for path in csrl.last_progress_checkpoint_paths:
+            print("Saved head-only progress checkpoint:", path, flush=True)
 
 
 if __name__ == "__main__":
