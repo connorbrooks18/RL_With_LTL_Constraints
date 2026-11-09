@@ -1,5 +1,8 @@
 For my undergraduate thesis at the University of Iowa, I am working with Prof. Shaoping Xiao on extending https://github.com/alperkamil/csrl to the POMDP case
 
+The completed Section One experiments, results, and visual gallery are
+summarized in [RESEARCH_RESULTS_REPORT.md](RESEARCH_RESULTS_REPORT.md).
+
 Initial steps:
   1. Tabular Q-learning -> approximate/neural network
   2. MDP -> POMDP (but just use most recent observation)

@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from dqn import DQN, GRUDQN
+from dqn import DQN, GRUDQN, RSSMDQN
 from evaluate_pomdp import action_name, build_environment
 
 
@@ -24,6 +24,15 @@ def load_policy(path: Path):
         model = GRUDQN(
             metadata["n_observations"], metadata["n_actions"],
             hidden_size=metadata["gru_hidden_size"], num_layers=metadata["gru_num_layers"],
+        )
+    elif metadata["architecture"] == "rssm":
+        grid, _oa, csrl, *_ = build_environment(float(metadata["observation_error"]))
+        model = RSSMDQN(
+            metadata["n_observations"], metadata["n_actions"],
+            (csrl.shape[0], grid.shape[0], grid.shape[1]),
+            hidden_size=metadata["rssm_deterministic_size"],
+            stochastic_variables=metadata["rssm_stochastic_variables"],
+            categorical_classes=metadata["rssm_categorical_classes"],
         )
     elif metadata["architecture"] == "mlp":
         model = DQN(
@@ -57,7 +66,7 @@ def observation_distribution(mdp, position, error_probability):
 
 def encoded_input(csrl, observation, model, metadata, repeat_count):
     pair, row, col = observation
-    if metadata["architecture"] == "gru":
+    if metadata["architecture"] in ("gru", "rssm"):
         if repeat_count == 1:
             observations = [observation]
             previous_actions = [None]
@@ -160,7 +169,7 @@ def draw_panel(ax, grid, q_map, action_modes, title, shared_limit=None):
 def plot_checkpoint(checkpoint_path: Path, output_path: Path, pair: int = 0):
     model, metadata = load_policy(checkpoint_path)
     grid, oa, csrl, *_ = build_environment(float(metadata["observation_error"]))
-    repeats = [1, 4] if metadata["architecture"] == "gru" else [1]
+    repeats = [1, 4] if metadata["architecture"] in ("gru", "rssm") else [1]
     fig, axes = plt.subplots(1, len(repeats), figsize=(6.3 * len(repeats), 6.1), squeeze=False)
     panels = [evaluate_panel(model, metadata, grid, oa, csrl, pair, count)
               for count in repeats]

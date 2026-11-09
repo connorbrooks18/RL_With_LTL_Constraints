@@ -17,7 +17,7 @@ import time
 import numpy as np
 import torch
 
-from dqn import GRUDQN
+from dqn import GRUDQN, RSSMDQN
 from evaluate_pomdp import build_environment
 
 
@@ -145,17 +145,7 @@ def _summary(samples):
 
 
 def _seed_aggregate(reports):
-    """Summarize checkpoint-level means across independent training seeds."""
-    metric_names = (
-        "mean_gru_dqn",
-        "mean_mdp_value_iteration_on_noisy_observation",
-        "paired_difference_gru_minus_vi",
-        "mean_gru_dqn_non_c_starts",
-        "mean_mdp_value_iteration_on_noisy_observation_non_c_starts",
-        "paired_difference_gru_minus_vi_non_c_starts",
-        "mean_mdp_value_iteration_full_state_oracle",
-        "mean_mdp_value_iteration_full_state_oracle_non_c_starts",
-    )
+    """Aggregate only independent training seeds with matching checkpoints."""
     # 95% Student-t critical values for small seed counts (n=2..10).
     t_critical = {
         2: 12.706,
@@ -168,26 +158,47 @@ def _seed_aggregate(reports):
         9: 2.306,
         10: 2.262,
     }
+    metric_names = (
+        "mean_policy_dqn",
+        "mean_mdp_value_iteration_on_noisy_observation",
+        "paired_difference_policy_minus_vi",
+        "mean_policy_dqn_non_c_starts",
+        "mean_mdp_value_iteration_on_noisy_observation_non_c_starts",
+        "paired_difference_policy_minus_vi_non_c_starts",
+        "mean_mdp_value_iteration_full_state_oracle",
+        "mean_mdp_value_iteration_full_state_oracle_non_c_starts",
+    )
+    groups = {}
+    for report in reports:
+        group_key = (
+            report.get("architecture", "unknown"),
+            int(report.get("training_episodes", -1)),
+            report.get("training_phase", "unknown"),
+        )
+        groups.setdefault(group_key, []).append(report)
     aggregate = {}
-    for name in metric_names:
-        entries = [report[name]["mean"] for report in reports
-                   if report.get(name) is not None]
-        if not entries:
-            continue
-        values = np.asarray(entries, dtype=float)
-        mean = float(values.mean())
-        if values.size == 1:
-            half_width = 0.0
-        else:
-            critical = t_critical.get(int(values.size), 1.96)
-            half_width = float(
-                critical * values.std(ddof=1) / np.sqrt(values.size)
-            )
-        aggregate[name] = {
-            "mean": mean,
-            "ci95_across_training_seeds": [mean - half_width, mean + half_width],
-            "n_training_seeds": int(values.size),
-        }
+    for (architecture, episodes, phase), group_reports in groups.items():
+        group = {}
+        for name in metric_names:
+            entries = [report[name]["mean"] for report in group_reports
+                       if report.get(name) is not None]
+            if not entries:
+                continue
+            values = np.asarray(entries, dtype=float)
+            mean = float(values.mean())
+            if values.size == 1:
+                half_width = 0.0
+            else:
+                critical = t_critical.get(int(values.size), 1.96)
+                half_width = float(
+                    critical * values.std(ddof=1) / np.sqrt(values.size)
+                )
+            group[name] = {
+                "mean": mean,
+                "ci95_across_training_seeds": [mean - half_width, mean + half_width],
+                "n_training_seeds": int(values.size),
+            }
+        aggregate[f"{architecture}_K{episodes}_{phase}"] = group
     return aggregate
 
 
@@ -205,15 +216,25 @@ def evaluate_checkpoint(
     evaluation_started_perf = time.perf_counter()
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     metadata = checkpoint["metadata"]
+    policy_key = f"{metadata.get('architecture', 'gru')}_dqn"
     env = build_environment(float(metadata["observation_error"]))
     grid, oa, csrl, valid_starts, _eps, _actions, _sinks = env
 
-    model = GRUDQN(
-        int(metadata["n_observations"]),
-        int(metadata["n_actions"]),
-        hidden_size=int(metadata["gru_hidden_size"]),
-        num_layers=int(metadata["gru_num_layers"]),
-    )
+    if metadata["architecture"] == "rssm":
+        model = RSSMDQN(
+            int(metadata["n_observations"]), int(metadata["n_actions"]),
+            (csrl.shape[0], grid.shape[0], grid.shape[1]),
+            hidden_size=int(metadata["rssm_deterministic_size"]),
+            stochastic_variables=int(metadata["rssm_stochastic_variables"]),
+            categorical_classes=int(metadata["rssm_categorical_classes"]),
+        )
+    else:
+        model = GRUDQN(
+            int(metadata["n_observations"]),
+            int(metadata["n_actions"]),
+            hidden_size=int(metadata["gru_hidden_size"]),
+            num_layers=int(metadata["gru_num_layers"]),
+        )
     model.load_state_dict(checkpoint["policy_state_dict"])
     model.eval()
 
@@ -248,13 +269,22 @@ def evaluate_checkpoint(
         item = {
             "square": [int(x) for x in start_square],
             "label": list(grid.label[start_square]),
-            "gru_dqn": _summary(dqn_returns),
+            "policy_dqn": _summary(dqn_returns),
             "mdp_value_iteration_on_noisy_observation": _summary(vi_returns),
-            "paired_difference_gru_minus_vi": _summary(delta),
+            "paired_difference_policy_minus_vi": _summary(delta),
         }
+        item[policy_key] = item["policy_dqn"]
+        item[f"paired_difference_{metadata.get('architecture', 'gru')}_minus_vi"] = item[
+            "paired_difference_policy_minus_vi"
+        ]
+        if metadata.get("architecture", "gru") == "gru":
+            item["paired_difference_gru_minus_vi"] = item[
+                "paired_difference_policy_minus_vi"
+            ]
         if include_rollout_samples:
             item["rollout_samples"] = {
-                "gru_dqn": dqn_returns,
+                "policy_dqn": dqn_returns,
+                policy_key: dqn_returns,
                 "mdp_value_iteration_on_noisy_observation": vi_returns,
             }
         if include_oracle:
@@ -280,6 +310,12 @@ def evaluate_checkpoint(
         "run_id": metadata.get("run_id"),
         "history_length": int(metadata["history_length"]),
         "training_seed": metadata.get("seed"),
+        "training_episodes": int(metadata.get("episodes", 0)),
+        "training_phase": metadata.get("training_phase", "unknown"),
+        "training_loop_seconds": float(metadata.get("training_loop_seconds", 0.0)),
+        "gru_frozen_at_checkpoint": bool(
+            metadata.get("gru_frozen_at_checkpoint", metadata.get("gru_frozen_at_end", False))
+        ),
         "evaluation_started_at_utc": evaluation_started_at.isoformat(),
         "evaluation_finished_at_utc": evaluation_finished_at.isoformat(),
         "evaluation_elapsed_seconds": time.perf_counter() - evaluation_started_perf,
@@ -295,12 +331,12 @@ def evaluate_checkpoint(
             "discount_accepting": float(csrl.discount_accepting),
         },
         "value_iteration": {"stopping_threshold": vi_threshold},
-        "mean_gru_dqn": _summary(all_dqn),
+        "mean_policy_dqn": _summary(all_dqn),
         "mean_mdp_value_iteration_on_noisy_observation": _summary(all_vi),
-        "paired_difference_gru_minus_vi": _summary(paired),
-        "mean_gru_dqn_non_c_starts": _summary(non_c_dqn),
+        "paired_difference_policy_minus_vi": _summary(paired),
+        "mean_policy_dqn_non_c_starts": _summary(non_c_dqn),
         "mean_mdp_value_iteration_on_noisy_observation_non_c_starts": _summary(non_c_vi),
-        "paired_difference_gru_minus_vi_non_c_starts": _summary(
+        "paired_difference_policy_minus_vi_non_c_starts": _summary(
             np.asarray(non_c_dqn) - np.asarray(non_c_vi)
         ),
         "mean_mdp_value_iteration_full_state_oracle": (
@@ -310,6 +346,11 @@ def evaluate_checkpoint(
             _summary(non_c_oracle) if include_oracle else None
         ),
         "starts": per_start,
+        "architecture": metadata.get("architecture", "gru"),
+        "model_variant": (
+            "RSSM-inspired fused recurrent categorical encoder; no stochastic feedback"
+            if metadata.get("architecture") == "rssm" else "GRU-DQN"
+        ),
         "baseline_definition": (
             "Exact product-MDP value iteration; at execution the policy is indexed "
             "by the noisy position reading and by an automaton state tracked from "
@@ -321,6 +362,24 @@ def evaluate_checkpoint(
             if include_oracle else None
         ),
     }
+    report[f"mean_{policy_key}"] = report["mean_policy_dqn"]
+    report[f"paired_difference_{metadata.get('architecture', 'gru')}_minus_vi"] = report[
+        "paired_difference_policy_minus_vi"
+    ]
+    report[f"mean_{policy_key}_non_c_starts"] = report[
+        "mean_policy_dqn_non_c_starts"
+    ]
+    if metadata.get("architecture", "gru") == "gru":
+        report["mean_gru_dqn"] = report["mean_policy_dqn"]
+        report["paired_difference_gru_minus_vi"] = report[
+            "paired_difference_policy_minus_vi"
+        ]
+        report["mean_gru_dqn_non_c_starts"] = report[
+            "mean_policy_dqn_non_c_starts"
+        ]
+        report["paired_difference_gru_minus_vi_non_c_starts"] = report[
+            "paired_difference_policy_minus_vi_non_c_starts"
+        ]
 
 
 def main():
@@ -357,12 +416,12 @@ def main():
         )
         reports.append(report)
         for name in (
-            "mean_gru_dqn",
+            "mean_policy_dqn",
             "mean_mdp_value_iteration_on_noisy_observation",
-            "paired_difference_gru_minus_vi",
-            "mean_gru_dqn_non_c_starts",
+            "paired_difference_policy_minus_vi",
+            "mean_policy_dqn_non_c_starts",
             "mean_mdp_value_iteration_on_noisy_observation_non_c_starts",
-            "paired_difference_gru_minus_vi_non_c_starts",
+            "paired_difference_policy_minus_vi_non_c_starts",
             "mean_mdp_value_iteration_full_state_oracle",
         ):
             result = report.get(name)
@@ -372,11 +431,6 @@ def main():
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     across_seeds = _seed_aggregate(reports)
-    if len(reports) > 1:
-        print("Across training seeds:")
-        for name, result in across_seeds.items():
-            lo, hi = result["ci95_across_training_seeds"]
-            print(f"  {name}: {result['mean']:.6f} (95% CI {lo:.6f}, {hi:.6f})")
     batch_finished_at = datetime.now(timezone.utc)
     output = {
         "evaluation_batch": {
@@ -392,6 +446,17 @@ def main():
         "across_training_seeds": across_seeds,
     }
     args.output.write_text(json.dumps(output, indent=2) + "\n")
+    if len(reports) > 1:
+        print("Across training seeds:")
+        for group_name, metrics in across_seeds.items():
+            print(f"  {group_name}:")
+            for metric_name, result in metrics.items():
+                lo, hi = result["ci95_across_training_seeds"]
+                print(
+                    f"    {metric_name}: {result['mean']:.6f} "
+                    f"(95% CI {lo:.6f}, {hi:.6f}; "
+                    f"n={result['n_training_seeds']})"
+                )
     print(f"Saved comparison report: {args.output}", flush=True)
 
 

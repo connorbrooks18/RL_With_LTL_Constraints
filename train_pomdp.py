@@ -38,13 +38,17 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=15_000)
     parser.add_argument("--horizon", type=int, default=600)
     parser.add_argument("--history-length", type=int, default=4)
+    parser.add_argument("--rssm-hidden-size", type=int, default=32)
+    parser.add_argument("--rssm-stochastic-variables", type=int, default=4)
+    parser.add_argument("--rssm-categorical-classes", type=int, default=4)
     parser.add_argument(
-        "--architecture", choices=("gru", "mlp"), default="gru",
-        help="gru uses an observation history; mlp is a feedforward no-history baseline",
+        "--architecture", choices=("gru", "rssm", "mlp"), default="gru",
+        help="gru and rssm use an observation history; mlp is feedforward",
     )
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--replay-update-every", type=int, default=4)
     parser.add_argument("--replay-capacity", type=int, default=100_000)
     parser.add_argument("--target-update-every", type=int, default=50)
     parser.add_argument("--epsilon-floor", type=float, default=0.1)
@@ -54,11 +58,15 @@ def main() -> None:
         help="freeze the GRU after this many episodes and train only the Q head",
     )
     parser.add_argument("--checkpoint-dir")
+    parser.add_argument(
+        "--checkpoint-episodes", type=int, nargs="*",
+        help="save intermediate policy snapshots at these episode counts",
+    )
     args = parser.parse_args()
     if args.checkpoint_dir is None:
-        if args.architecture == "gru":
+        if args.architecture in ("gru", "rssm"):
             args.checkpoint_dir = (
-                f"checkpoints_pomdp_history{args.history_length}_seed{args.seed}"
+                f"checkpoints_pomdp_{args.architecture}_history{args.history_length}_seed{args.seed}"
             )
         else:
             args.checkpoint_dir = f"checkpoints_pomdp_mlp_seed{args.seed}"
@@ -82,12 +90,12 @@ def main() -> None:
     )
 
     print(
-        "Starting POMDP GRU-DQN run:",
+        f"Starting POMDP {args.architecture.upper()}-DQN run:",
         f"episodes={args.episodes}, horizon={args.horizon},",
         f"architecture={args.architecture}, history={args.history_length}, seed={args.seed}",
         flush=True,
     )
-    progress_checkpoints = (
+    progress_checkpoints = args.checkpoint_episodes or (
         range(args.freeze_gru_after_episodes + 2_500, args.episodes, 2_500)
         if args.freeze_gru_after_episodes is not None else ()
     )
@@ -104,6 +112,7 @@ def main() -> None:
         gru_hidden_size=64,
         partial_observation=True,
         batch_size=args.batch_size,
+        replay_update_every=args.replay_update_every,
         replay_capacity=args.replay_capacity,
         target_update_every=args.target_update_every,
         checkpoint_dir=args.checkpoint_dir,
@@ -111,6 +120,9 @@ def main() -> None:
         return_model=True,
         freeze_gru_after_episodes=args.freeze_gru_after_episodes,
         additional_checkpoint_episodes=progress_checkpoints,
+        rssm_deterministic_size=args.rssm_hidden_size,
+        rssm_stochastic_variables=args.rssm_stochastic_variables,
+        rssm_categorical_classes=args.rssm_categorical_classes,
     )
     print("Training summary:", csrl.last_training_return_summary, flush=True)
     print("Saved checkpoint:", csrl.last_checkpoint_path, flush=True)

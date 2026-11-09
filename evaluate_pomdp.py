@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from controlsyn import ControlSynthesis
-from dqn import GRUDQN
+from dqn import GRUDQN, RSSMDQN
 from mdp import GridMDP
 from oa import OmegaAutomaton
 
@@ -82,12 +82,21 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
     grid, oa, csrl, valid_starts, epsilon_actions, global_actions, rejecting_sinks = (
         build_environment(float(metadata["observation_error"]))
     )
-    model = GRUDQN(
-        metadata["n_observations"],
-        metadata["n_actions"],
-        hidden_size=metadata["gru_hidden_size"],
-        num_layers=metadata["gru_num_layers"],
-    )
+    if metadata["architecture"] == "rssm":
+        model = RSSMDQN(
+            metadata["n_observations"], metadata["n_actions"],
+            (csrl.shape[0], grid.shape[0], grid.shape[1]),
+            hidden_size=metadata["rssm_deterministic_size"],
+            stochastic_variables=metadata["rssm_stochastic_variables"],
+            categorical_classes=metadata["rssm_categorical_classes"],
+        )
+    else:
+        model = GRUDQN(
+            metadata["n_observations"],
+            metadata["n_actions"],
+            hidden_size=metadata["gru_hidden_size"],
+            num_layers=metadata["gru_num_layers"],
+        )
     model.load_state_dict(checkpoint["policy_state_dict"])
     model.eval()
     history_length = int(metadata["history_length"])

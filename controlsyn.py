@@ -517,15 +517,21 @@ class ControlSynthesis:
                         gru_hidden_size=64, partial_observation=None,
                         return_model=False, metadata_extra=None,
                         freeze_gru_after_episodes=None,
-                        additional_checkpoint_episodes=None):
+                        additional_checkpoint_episodes=None,
+                        rssm_deterministic_size=32,
+                        rssm_stochastic_variables=4,
+                        rssm_categorical_classes=4,
+                        replay_update_every=4):
         """Train a DQN, optionally from partial observations and fixed histories.
 
-        ``architecture="gru"`` consumes the most recent ``history_length``
-        observation tokens. In partial-observation mode each token omits the
-        true automaton state and includes the preceding action, so the network
-        can track recent automaton progress caused by its own epsilon choices.
-        The hidden state is recomputed from this fixed window at each decision;
-        information older than ``history_length`` is not retained.
+        ``architecture="gru"`` and ``architecture="rssm"`` consume the most
+        recent ``history_length`` observation tokens. In partial-observation
+        mode each token omits the true automaton state and includes the
+        preceding action, so the network can track recent automaton progress
+        caused by its own epsilon choices. The recurrent state is recomputed
+        from this fixed window at each decision; information older than
+        ``history_length`` is not retained. RSSM adds a categorical prior and
+        posterior with auxiliary observation, reward, and KL losses.
         When epsilon commitment determines future epsilon availability from
         the controller's own actions, the mask follows that observable history.
         Otherwise unavailable epsilon attempts are no-ops under a global mask.
@@ -557,10 +563,13 @@ class ControlSynthesis:
         if not 0.0 < epsilon_decay_fraction <= 1.0:
             raise ValueError("epsilon_decay_fraction must be in (0, 1]")
         epsilon_decay_episodes = max(1, int(np.ceil(K * epsilon_decay_fraction)))
-        update_every = 4
+        update_every = int(replay_update_every)
+        if update_every <= 0:
+            raise ValueError("replay_update_every must be positive")
         n_actions = self.shape[-1]
-        if architecture not in ("linear", "mlp", "gru"):
-            raise ValueError("architecture must be 'linear', 'mlp', or 'gru'")
+        if architecture not in ("linear", "mlp", "gru", "rssm"):
+            raise ValueError("architecture must be 'linear', 'mlp', 'gru', or 'rssm'")
+        recurrent_architecture = architecture in ("gru", "rssm")
         if freeze_gru_after_episodes is not None:
             freeze_gru_after_episodes = int(freeze_gru_after_episodes)
             if architecture != "gru":
@@ -581,7 +590,7 @@ class ControlSynthesis:
             # true automaton state. Preserve legacy fully-observed baselines
             # when the MDP observation channel is exact.
             partial_observation = (
-                architecture == "gru" or self.mdp.observation_error > 0.0
+                recurrent_architecture or self.mdp.observation_error > 0.0
             )
         partial_observation = bool(partial_observation)
         observation_factors = (
@@ -604,12 +613,22 @@ class ControlSynthesis:
             recurrent_token_size = sum(observation_factors) + 1 + n_actions
             epsilon_commitment_size = self.oa.shape[1]
             n_observations = recurrent_token_size + epsilon_commitment_size
-            hidden_size = gru_hidden_size
+            hidden_size = (
+                int(rssm_deterministic_size)
+                if architecture == "rssm" else gru_hidden_size
+            )
 
         def new_network():
             if architecture == "gru":
                 return dqn.GRUDQN(
                     n_observations, n_actions, hidden_size=gru_hidden_size
+                ).to(device)
+            if architecture == "rssm":
+                return dqn.RSSMDQN(
+                    n_observations, n_actions, observation_factors,
+                    hidden_size=rssm_deterministic_size,
+                    stochastic_variables=rssm_stochastic_variables,
+                    categorical_classes=rssm_categorical_classes,
                 ).to(device)
             return dqn.DQN(n_observations, n_actions,
                            hidden_size=hidden_size).to(device)
@@ -652,7 +671,7 @@ class ControlSynthesis:
         # its own action history without observing hidden q.
         epsilon_commit_mask_supported = (
             partial_observation
-            and architecture == "gru"
+            and recurrent_architecture
             and bool(epsilon_targets)
             and epsilon_sources == {self.oa.q0}
             and all(not self.oa.eps[q] for q in epsilon_targets)
@@ -677,7 +696,7 @@ class ControlSynthesis:
                 encoded = torch.zeros(n_observations, dtype=torch.float32,
                                       device=device)
                 encoded[index] = 1.0
-            elif architecture == "gru":
+            elif recurrent_architecture:
                 encoded = self.encode_observation(
                     observation,
                     partial_observation=partial_observation,
@@ -723,7 +742,7 @@ class ControlSynthesis:
 
         # For feed-forward networks, cache canonical (noise-free) encodings.
         # A recurrent policy instead builds a fresh history window per step.
-        if architecture != "gru":
+        if not recurrent_architecture:
             encoded_states = {
                 state: encode_state(state, error_prob=0.0)
                 for state in self.states()
@@ -779,7 +798,15 @@ class ControlSynthesis:
             mask = torch.tensor([s is not None for s in batch.next_state],
                                 device=device, dtype=torch.bool)
             next_states = [s for s in batch.next_state if s is not None]
-            state_values = policy_net(torch.cat(batch.state)).gather(1, torch.cat(batch.action))
+            current_histories = torch.cat(batch.state)
+            if architecture == "rssm":
+                current_q_values, current_latent, current_kl = (
+                    policy_net.forward_features(current_histories)
+                )
+            else:
+                current_q_values = policy_net(current_histories)
+                current_latent = current_kl = None
+            state_values = current_q_values.gather(1, torch.cat(batch.action))
             next_values = torch.zeros(batch_size, device=device)
             if next_states:
                 with torch.no_grad():
@@ -798,6 +825,30 @@ class ControlSynthesis:
                     next_values[mask] = target_next_q.clamp(0.0, 1.0)
             expected = torch.cat(batch.reward) + torch.cat(batch.discount) * next_values
             loss = criterion(state_values, expected.unsqueeze(1))
+            if architecture == "rssm":
+                valid_next_indices = [
+                    index for index, next_state in enumerate(batch.next_state)
+                    if next_state is not None
+                ]
+                next_histories_for_aux = (
+                    torch.cat([batch.next_state[index]
+                               for index in valid_next_indices])
+                    if valid_next_indices else None
+                )
+                auxiliary, diagnostics = policy_net.auxiliary_loss_from_features(
+                    current_latent,
+                    current_kl,
+                    torch.cat(batch.action),
+                    next_histories_for_aux,
+                    torch.cat(batch.reward),
+                    observation_indices=(
+                        torch.as_tensor(valid_next_indices, dtype=torch.long,
+                                         device=device)
+                        if valid_next_indices else None
+                    ),
+                )
+                loss = loss + auxiliary
+                self.last_rssm_auxiliary_metrics = diagnostics
             optimizer.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
             optimizer.step()
@@ -838,7 +889,7 @@ class ControlSynthesis:
             state = (self.shape[0]-1, self.oa.q0) + mdp_start
             epsilon_committed = False
             epsilon_target = None
-            if architecture == "gru":
+            if recurrent_architecture:
                 history_tokens = [observed_token(state)]
                 st = history_encoding(
                     history_tokens, epsilon_target=epsilon_target
@@ -891,7 +942,7 @@ class ControlSynthesis:
                 next_epsilon_target = epsilon_target
                 if action in global_epsilon_actions and next_epsilon_target is None:
                     next_epsilon_target = action - len(self.mdp.A)
-                if architecture == "gru":
+                if recurrent_architecture:
                     next_token = observed_token(next_state, previous_action=action)
                     next_history_tokens = (
                         history_tokens + [next_token]
@@ -934,7 +985,7 @@ class ControlSynthesis:
                     )
                 state = next_state
                 st = next_st
-                if architecture == "gru":
+                if recurrent_architecture:
                     history_tokens = next_history_tokens
                 epsilon_committed = next_epsilon_committed
                 epsilon_target = next_epsilon_target
@@ -1050,7 +1101,7 @@ class ControlSynthesis:
                 # here uses a cold-start history containing only this clean
                 # current observation; use the returned model for live policy
                 # decisions with the actual observation history.
-                if architecture == "gru":
+                if recurrent_architecture:
                     token = observed_token(state, error_prob=0.0)
                     network_input = history_encoding([token])
                 else:
@@ -1130,16 +1181,47 @@ class ControlSynthesis:
                 "gru_frozen_at_end": bool(gru_frozen),
                 "joint_gru_head_training_seconds": joint_phase_seconds,
                 "head_only_training_seconds": head_only_phase_seconds,
+                "joint_rssm_q_training_seconds": (
+                    training_loop_seconds if architecture == "rssm" else None
+                ),
                 "gru_parameter_count": (
                     int(sum(p.numel() for p in policy_net.gru.parameters()))
                     if architecture == "gru" else None
                 ),
+                "rssm_parameter_count": (
+                    int(sum(p.numel() for p in policy_net.parameters()))
+                    if architecture == "rssm" else None
+                ),
+                "rssm_deterministic_size": (
+                    int(rssm_deterministic_size) if architecture == "rssm" else None
+                ),
+                "rssm_stochastic_variables": (
+                    int(rssm_stochastic_variables) if architecture == "rssm" else None
+                ),
+                "rssm_categorical_classes": (
+                    int(rssm_categorical_classes) if architecture == "rssm" else None
+                ),
+                "rssm_transition_core": (
+                    "fused_observation_action_gru" if architecture == "rssm" else None
+                ),
+                "rssm_stochastic_latent_feedback": (
+                    False if architecture == "rssm" else None
+                ),
+                "rssm_auxiliary_weights": (
+                    {"observation": 0.1, "reward": 0.1, "kl": 0.01}
+                    if architecture == "rssm" else None
+                ),
+                "rssm_auxiliary_metrics_at_last_update": (
+                    getattr(self, "last_rssm_auxiliary_metrics", None)
+                    if architecture == "rssm" else None
+                ),
                 "q_head_parameter_count": (
                     int(sum(p.numel() for p in policy_net.q_head.parameters()))
-                    if architecture == "gru" else None
+                    if recurrent_architecture else None
                 ),
                 "training_phase": (
                     "head_only_after_frozen_gru" if gru_frozen
+                    else "joint_rssm_encoder_and_q_head" if architecture == "rssm"
                     else "joint_gru_and_q_head"
                 ),
                 "start_mdp_square": list(map(int, start)) if start is not None else None,
@@ -1165,15 +1247,15 @@ class ControlSynthesis:
                     if partial_observation else
                     "pair,automaton state,row,column"
                 ),
-                "history_length": int(history_length) if architecture == "gru" else None,
+                "history_length": int(history_length) if recurrent_architecture else None,
                 "gru_hidden_size": int(gru_hidden_size) if architecture == "gru" else None,
-                "recurrent_token_includes_previous_action": architecture == "gru",
-                "recurrent_input_includes_epsilon_commitment": architecture == "gru",
+                "recurrent_token_includes_previous_action": recurrent_architecture,
+                "recurrent_input_includes_epsilon_commitment": recurrent_architecture,
                 "recurrent_epsilon_commitment_mode": (
-                    "target_one_hot" if architecture == "gru" else "none"
+                    "target_one_hot" if recurrent_architecture else "none"
                 ),
                 "recurrent_epsilon_commitment_size": (
-                    int(epsilon_commitment_size) if architecture == "gru" else 0
+                    int(epsilon_commitment_size) if recurrent_architecture else 0
                 ),
                 "observation_error": float(self.mdp.observation_error),
                 "recurrent_padding": "left zero padding with valid-token bit",
@@ -1189,11 +1271,12 @@ class ControlSynthesis:
                 ),
                 "q_table_semantics": (
                     "cold-start history with one clean current observation"
-                    if architecture == "gru" else None
+                    if recurrent_architecture else None
                 ),
                 "replay_capacity": int(replay_capacity),
                 "batch_size": int(batch_size),
                 "update_every": int(update_every),
+                "replay_update_every_environment_steps": int(update_every),
                 "target_update_every": int(target_update_every),
                 "discount_nonaccepting": float(self.discount_nonaccepting),
                 "discount_accepting": float(self.discount_accepting),
@@ -1330,6 +1413,7 @@ class ControlSynthesis:
                     ),
                     "training_phase": (
                         "head_only_after_frozen_gru" if snapshot["gru_frozen"]
+                        else "joint_rssm_encoder_and_q_head" if architecture == "rssm"
                         else "joint_gru_and_q_head"
                     ),
                     "gru_frozen_at_checkpoint": bool(snapshot["gru_frozen"]),

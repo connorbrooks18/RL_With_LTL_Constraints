@@ -10,4 +10,5 @@ checkpoints_pomdp_history4_seed*/
 checkpoints_pomdp_mlp_seed*/
 checkpoints_office_history4_seed*/
 checkpoints_gru_freeze_ab/
+checkpoints_rssm*/
 logs/

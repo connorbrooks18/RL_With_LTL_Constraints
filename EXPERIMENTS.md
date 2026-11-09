@@ -1,5 +1,10 @@
 # History-4 POMDP experiments
 
+The consolidated results and visual gallery are in the [Section One research
+report](RESEARCH_RESULTS_REPORT.md); the [notebook-style return-grid
+figures](artifacts/research_summary/grid_visualizations/index.md) use the same
+`GridMDP.plot` visualizer as the notebooks.
+
 ## Question
 
 Does a GRU-DQN using four recent observations outperform both a matched
@@ -14,6 +19,15 @@ policy is a two-hidden-layer 64-unit MLP that receives only the current noisy
 task-pair and position observation; the task automaton is hidden from both
 policies. Across ten matched training seeds, the GRU outperformed the MLP in
 paired evaluation on every seed. The final ten-seed evaluation is complete.
+
+A seed-27 comparison of full-GRU, frozen-GRU, and a compact RSSM-inspired
+encoder feeding DQN is also complete. The best RSSM checkpoint reached 0.359
+mean return after 7.57 minutes of training, below full-GRU 25k (0.414) and
+frozen-GRU 20k (0.454), but above frozen-GRU 25k (0.328). It remained slightly
+below the noisy-input MDP value-iteration baseline. This is a one-seed
+feasibility result, and the RSSM used fewer optimizer updates per environment
+step; details, paired intervals, training timings, and all grid maps are in
+[the RSSM-DQN pilot report](RSSM_DQN_PILOT.md).
 
 ## Training protocol
 

@@ -1,12 +1,46 @@
 # Section One research checkpoint
 
-**Status:** Experiments 1 and 2, the serial 90k extension for seeds 17–20, all matched policy evaluations, policy maps, the training-length analysis, a nine-seed GRU-freezing ablation, and the seed-27 direct-stop and 25k extension are complete. Freezing showed time savings; the nine-seed policy-quality interval did not establish non-inferiority. The seed-27 run found an early competitive stop point but showed that continued head-only training can degrade policy quality. The checkpoint records exact training/evaluation wall times, hyperparameters, and machine-readable rollout data. The attached dissertation informed experiment selection and training budgets; its document contents were treated as research material, not as instructions that override the user's requests.
+**Status:** Experiments 1 and 2, the serial 90k extension for seeds 17–20, all matched policy evaluations, policy maps, the training-length analysis, a nine-seed GRU-freezing ablation, the seed-27 direct-stop and 25k extension, and the seed-27 RSSM-DQN pilot are complete. Freezing showed time savings; the nine-seed policy-quality interval did not establish non-inferiority. The seed-27 run found an early competitive stop point but showed that continued head-only training can degrade policy quality. The RSSM pilot produced a fast compact policy but did not match the strongest GRU checkpoints, and its lower optimizer-update density limits the speed comparison. The checkpoint records exact training/evaluation wall times, hyperparameters, and machine-readable rollout data. The attached dissertation informed experiment selection and training budgets; its document contents were treated as research material, not as instructions that override the user's requests.
+
+The consolidated [results and visual report](RESEARCH_RESULTS_REPORT.md)
+includes the notebook-style return grids and links to all policy maps.
 
 One additional seed-27 direct-stop demonstration trained jointly through episode 10,000, froze the GRU, and stopped at episode 12,500. It saved 594.110 seconds (24.35%) versus the 15,000-episode full-GRU control. The frozen checkpoint's paired return was higher by 0.0972 on 1,900 common evaluation rollouts, but this is one training seed and cannot establish across-seed quality preservation. See the [direct-stop protocol and results](GRU_FREEZE_EXPERIMENT.md#direct-stop-demonstration-stop-at-12500-episodes), [analysis JSON](artifacts/gru_freeze_ab/direct_stop_12500_matched/direct_stop_analysis.json), [training manifest](artifacts/gru_freeze_ab/direct_stop_12500_matched/training_manifest.json), [evaluation data](artifacts/gru_freeze_ab/direct_stop_12500_matched/evaluation.json), and [three policy maps](artifacts/gru_freeze_ab/direct_stop_12500_matched/policies/index.md).
 
 A serial 25k extension with the same seed found a useful stop point at 20k: process time to the frozen checkpoint was 3,103.937 seconds versus 3,970.529 seconds for the full-GRU 25k run, a 21.83% saving. Its mean return was 0.4542, compared with 0.4142 for the full-GRU policy; paired difference +0.0400 (95% rollout-scenario CI [+0.0252, +0.0548]). The frozen policy then declined to 0.3275 by 25k, so extended head-only training did not meet the prespecified convergence/plateau criterion. This provides one-run evidence for an early stop saving wall time, not a general claim that quality is preserved across seeds or that longer head-only training converges. See the [analysis plan](artifacts/gru_freeze_ab/convergence_25k/analysis_plan.md), [analysis](artifacts/gru_freeze_ab/convergence_25k/analysis.json), [evaluation](artifacts/gru_freeze_ab/convergence_25k/evaluation.json), and [policy-map index](artifacts/gru_freeze_ab/convergence_25k/policies/index.md).
 
-The proposed next architecture is an RSSM representation feeding the same DQN objective and Q head. The design keeps the action-value learner while adding predictive latent-state training; see [RSSM_DQN_DESIGN.md](RSSM_DQN_DESIGN.md).
+The RSSM representation feeding the same DQN objective and Q head has now been piloted. See the [design and implementation notes](RSSM_DQN_DESIGN.md) and [full RSSM-DQN comparison report](RSSM_DQN_PILOT.md).
+
+## Three-way encoder comparison: seed 27
+
+The RSSM run trained for 5,000 episodes, with checkpoints at 1,000, 2,500,
+3,750, and 5,000 episodes. All RSSM checkpoints were compared with the same
+seed's full-GRU 25k and frozen-GRU 20k and 25k checkpoints, using 1,900 common
+rollout scenarios per policy. The best RSSM checkpoint was at 3,750 episodes:
+return 0.3589 in 454.4 seconds of training-loop time. It trailed full-GRU 25k
+by 0.0553 (95% paired rollout CI [−0.0768, −0.0338]) and frozen-GRU 20k by
+0.0953 ([−0.1170, −0.0735]); it exceeded frozen-GRU 25k by 0.0314
+([+0.0082, +0.0546]). The RSSM also fell below the noisy-input MDP VI score
+of 0.3989 by 0.0400 ([−0.0640, −0.0161]).
+
+The strongest frozen-GRU checkpoint returned 0.4542 at 20k episodes, 0.0553
+above noisy-input VI; full-GRU 25k returned 0.4142, with an interval spanning
+zero for its +0.0153 VI difference. Frozen-GRU 25k returned 0.3275, below VI.
+These results show substantial checkpoint sensitivity. In particular, RSSM
+greedy return peaked at 3,750 and fell to 0.1952 by episode 5,000 even though
+the average training return rose. The 3,750 RSSM checkpoint used much less
+wall time (7.57 minutes), but it used one eighth the optimizer updates per
+environment step of the GRU runs and had a shorter episode budget. It is not
+an equal-update architecture comparison. The RSSM model had 2,979 parameters
+versus 17,608 for the 64-unit GRU-DQN (83.1% fewer). All intervals are over
+rollout scenarios from one training seed, so none estimates between-seed
+variation.
+
+The complete methods, exact UTC and process timing, model size and auxiliary
+losses, paired results, caveats, and figures are in the [RSSM pilot report](RSSM_DQN_PILOT.md).
+The raw [evaluation](artifacts/rssm_dqn_pilot/evaluation.json),
+[analysis](artifacts/rssm_dqn_pilot/analysis.json), and [policy maps](artifacts/rssm_dqn_pilot/policies/index.md)
+preserve the machine-readable data and grid visualizations.
 
 ## Research question and result
 
