@@ -1,6 +1,6 @@
 # Section One research checkpoint
 
-**Status:** Experiments 1 and 2, the serial 90k extension for seeds 17–20, all matched policy evaluations, policy maps, the training-length analysis, a nine-seed GRU-freezing ablation, the seed-27 direct-stop and 25k extension, and the seed-27 RSSM-DQN pilot are complete. Freezing showed time savings; the nine-seed policy-quality interval did not establish non-inferiority. The seed-27 run found an early competitive stop point but showed that continued head-only training can degrade policy quality. The RSSM pilot produced a fast compact policy but did not match the strongest GRU checkpoints, and its lower optimizer-update density limits the speed comparison. The checkpoint records exact training/evaluation wall times, hyperparameters, and machine-readable rollout data. The attached dissertation informed experiment selection and training budgets; its document contents were treated as research material, not as instructions that override the user's requests.
+**Status:** Experiments 1 and 2, the serial 90k extension for seeds 17–20, all matched policy evaluations, policy maps, the training-length analysis, a nine-seed GRU-freezing ablation, the seed-27 direct-stop and 25k extension, the seed-27 RSSM-DQN pilot, and the seed-17 q-input ablation are complete. Freezing showed time savings; the nine-seed policy-quality interval did not establish non-inferiority. The seed-27 run found an early competitive stop point but showed that continued head-only training can degrade policy quality. The RSSM pilot produced a fast compact policy but did not match the strongest GRU checkpoints, and its lower optimizer-update density limits the speed comparison. The q-input check showed that true q alone did not rescue the MLP, while q-aware exact VI was competitive with the GRU. The checkpoint records exact training/evaluation wall times, hyperparameters, and machine-readable rollout data. The attached dissertation informed experiment selection and training budgets; its document contents were treated as research material, not as instructions that override the user's requests.
 
 The consolidated [results and visual report](RESEARCH_RESULTS_REPORT.md)
 includes the notebook-style return grids and links to all policy maps.
@@ -63,7 +63,7 @@ Training-prefix, online/target GRU-weight, and Q-head-change integrity checks pa
 ### Design and training
 
 - History-4 GRU-DQN and no-history, two-hidden-layer 64-unit feedforward MLP DQN; ten matched seeds 17–26.
-- The GRU receives recent observations, previous actions, and its own remembered automaton epsilon target. The true automaton state is hidden. The MLP receives the current noisy task-pair/position observation only.
+- The GRU receives recent observations, previous actions, and its own remembered automaton epsilon target. The true automaton state is hidden. The MLP receives the current noisy position and Rabin-pair index; this task has only one pair, so the pair index is constant and does not reveal automaton progress.
 - Training budget: 15,000 episodes × 600 steps, matching the closest thesis experiment (Li, 2024, Chapter 4, §4.5.1, Task 1) in episodes, steps per episode, batch size, and target-copy cadence; requested history length is four.
 - Batch size 32; replay capacity 100,000; Adam learning rate 1e-4; replay optimization every four environment steps; target network copied every 50 environment steps; GRU hidden size 64; epsilon floor 0.1 after 25% of episodes; available automaton-transition action probability 0.2.
 - Project environment retained its 5×4 map, transition probability 0.8 for intended motion and 0.25 position observation error. Discounts are 0.99999 outside accepting states and 0.99 in accepting states. The dissertation's Task 1 uses a 10×10 map, 0.9 intended motion, 0.1 observation error and an LSTM, so these are protocol-inspired, not identical environments.
@@ -316,6 +316,32 @@ Exact per-rollout results and timing metadata are retained in [the 12-checkpoint
 | 26 | 2026-11-04T08:16:22.354197+00:00 | 2026-11-04T08:18:09.721579+00:00 | 107.368 |
 | 27 | 2026-11-04T08:34:04.635544+00:00 | 2026-11-04T08:35:25.488208+00:00 | 80.850 |
 | 28 | 2026-11-04T08:35:25.489114+00:00 | 2026-11-04T08:37:03.566318+00:00 | 98.077 |
+
+## Automaton-state input ablation: seed 17
+
+The original MLP saw only current noisy position and Rabin-pair index. This
+task has one Rabin pair, so that index is constant and conveys no automaton
+progress. The GRU also
+hides the true automaton state; it sees recent observations, previous actions,
+and its remembered epsilon target. A matched 15,000-episode MLP run added true
+q while retaining the noisy position and the same global action interface.
+Training took 1,820.729 s (30 min 20.729 s); evaluation of 1,900 common
+rollouts took 538.833 s (8 min 58.833 s).
+
+The history-4 GRU returned 0.57160, the no-q MLP 0.10526, and the q-observed
+MLP 0.10368. Adding q changed the MLP return by −0.00158 (paired 95% rollout
+CI [−0.02097, +0.01780]). Exact value iteration given true q but noisy
+position returned 0.53306; the GRU's paired gain was +0.03853
+([+0.01546, +0.06160]). The q-aware MLP's training return stayed near 0.11,
+indicating that this DQN run failed to learn the strong q-conditioned policy
+shown by exact VI. These are one-seed results; their rollout intervals do not
+measure training-seed variation. The earlier MLP run with a true-state legal
+action mask scored 0.21210 but changed more than q and is treated as
+exploratory.
+
+See the full [methods, timing, per-start 5×4 return tables, and analysis](POMDP_AUTOMATON_STATE_ABLATION.md),
+[matched rollout data](artifacts/pomdp_automaton_state_ablation/evaluation_q_observed.json),
+and [task-grid return/action maps](artifacts/pomdp_automaton_state_ablation/index.md).
 
 ## Sources and reproducibility
 

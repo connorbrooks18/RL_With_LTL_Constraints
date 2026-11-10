@@ -32,6 +32,7 @@ def _rollout(
     value_iteration_value=None,
     value_iteration_policy=None,
     oracle=False,
+    automaton_state_observed=False,
 ):
     np.random.seed(int(rollout_seed))
     transition_rng = np.random.default_rng(int(rollout_seed) + 1)
@@ -78,7 +79,8 @@ def _rollout(
             action = int(value_iteration_policy[state])
         else:
             observed_pair, observed_row, observed_col = observation
-            estimated_state = (0, inferred_q, observed_row, observed_col)
+            estimated_q = state[1] if automaton_state_observed else inferred_q
+            estimated_state = (0, estimated_q, observed_row, observed_col)
             if epsilon_target is None:
                 action = int(value_iteration_policy[estimated_state])
             else:

@@ -13,6 +13,7 @@ transfer, GRU-freezing, and RSSM-DQN experiments. The headline results are:
 | One-agent office transfer | Mean probability of completing at least two safe LTL cycles: 0.114 (95% CI 0.004–0.224). | 10k episodes; 7 seeds |
 | GRU freezing | Saved about 9% wall time across nine paired seeds; quality preservation was inconclusive under the registered margin. | 15k episodes; 9 seeds |
 | RSSM-inspired encoder into DQN | Best checkpoint returned 0.359 after 7.57 minutes; below the strongest GRU checkpoints and noisy-input VI. | 5k-episode pilot; 1 seed |
+| Automaton-state input ablation | True q alone did not rescue the MLP (0.104); GRU scored 0.572 and true-q VI 0.533. | Matched seed 17; 1,900 common rollout scenarios |
 
 The strongest supported Section One claim is specific: a history-4 GRU-DQN
 trained on partial observations substantially improves over a matched
@@ -138,12 +139,25 @@ canonical RSSM, and the pilot used one eighth as many DQN updates per
 environment step as the GRU baseline. It is useful feasibility evidence, not
 an equal-update architecture comparison.
 
+### Does the GRU receive the automaton state?
+
+No: the GRU receives recent noisy positions, previous actions, and memory of
+its own epsilon target, while the true automaton state remains hidden. The
+original MLP also hid q. In a controlled seed-17 follow-up, giving q to the MLP
+did not improve its return (0.104 versus 0.105 without q). Exact value
+iteration using true q and noisy position scored 0.533; the GRU scored 0.572
+on paired scenarios. This points to a learning failure in the q-aware MLP run,
+not a fundamental limit on feedforward policies. See the [full automaton-state
+ablation report](POMDP_AUTOMATON_STATE_ABLATION.md) and its [grid and action
+maps](artifacts/pomdp_automaton_state_ablation/index.md).
+
 ## Full report and data
 
 - [Experiment 1 and office results, per-cell tables, and references](EXPERIMENTS.md)
 - [Section One research checkpoint](SECTION_ONE_CHECKPOINT.md)
 - [GRU-freezing design, timing, and seed-level results](GRU_FREEZE_EXPERIMENT.md)
 - [RSSM design, hyperparameters, wall times, paired results, and limitations](RSSM_DQN_PILOT.md)
+- [Automaton-state MLP and q-aware VI ablation](POMDP_AUTOMATON_STATE_ABLATION.md)
 - [All 23 notebook-style grid visuals](artifacts/research_summary/grid_visualizations/index.md)
 
 Machine-readable rollout reports and training manifests are linked from those

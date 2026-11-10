@@ -16,7 +16,7 @@ measures performance against the regular MDP policy with noisy state indices.
 The matched GRU versus no-GRU runs use the same environment, seeds, episode
 budget, step budget, replay settings, and evaluation scenarios. The no-GRU
 policy is a two-hidden-layer 64-unit MLP that receives only the current noisy
-task-pair and position observation; the task automaton is hidden from both
+position and constant Rabin-pair index; the task automaton state is hidden from both
 policies. Across ten matched training seeds, the GRU outperformed the MLP in
 paired evaluation on every seed. The final ten-seed evaluation is complete.
 
@@ -83,7 +83,7 @@ checkpoint-name collision.
 
 The primary no-GRU baseline is a feedforward MLP DQN trained for the same
 15,000 episodes and 600 steps per episode as each history-4 GRU. It receives
-the current noisy `(task pair, row, column)` observation only. Both models hide
+the current noisy `(Rabin-pair index, row, column)` observation only. Both models hide
 the true automaton state. The MLP receives neither observation history nor
 previous actions. Evaluation pairs each matched training seed on common
 rollout seeds, every traversable start square, 100 rollouts per square, and a
@@ -899,3 +899,49 @@ still does not establish policy-quality preservation across seeds. See the
 [25k paired analysis](artifacts/gru_freeze_ab/convergence_25k/analysis.json),
 [trajectory plot](artifacts/gru_freeze_ab/convergence_25k/convergence.png),
 and [policy maps](artifacts/gru_freeze_ab/convergence_25k/policies/index.md).
+
+## Does the GRU receive the automaton state? q-input ablation
+
+The original no-history MLP did not receive q: like the GRU, it saw the task
+pair and noisy position. The GRU's additional recurrent inputs are previous
+actions and its own remembered epsilon target; these are not the true current
+automaton state. A controlled seed-17 run therefore gave q to an MLP while
+keeping the same noisy position channel and the same global action interface.
+This avoids changing the input and the true-state legal-action mask together.
+
+The MLP-DQN was trained for 15,000 episodes × 600 steps (9 million
+environment steps), serially for 1,820.729 s (30 min 20.729 s), with AdamW
+learning rate 1e-4, batch 32, replay capacity 100,000, replay optimization
+every four steps, target copies every 50 steps, and epsilon reduced from 1.0 to
+0.1 over 25% of episodes. Position observation error was 0.25; q was read
+exactly; unavailable epsilon actions remained no-ops under the shared global
+action set. The two 64-unit-hidden-layer MLPs had 5,640 parameters with q and
+5,384 without q.
+
+| Policy | Mean return | 95% rollout-scenario CI |
+|:--|--:|:--|
+| History-4 GRU-DQN, seed 17 | 0.57160 | [0.54944, 0.59375] |
+| Current-observation MLP, q hidden | 0.10526 | [0.09146, 0.11906] |
+| MLP with true q and noisy position | 0.10368 | [0.08997, 0.11739] |
+| Exact value iteration, inferred q and noisy position | 0.39890 | [0.37688, 0.42092] |
+| Exact value iteration, true q and noisy position | 0.53306 | [0.51063, 0.55550] |
+| Full-state VI oracle | 0.76462 | [0.74562, 0.78362] |
+
+Every policy used the same 1,900 evaluation scenarios (100 per traversable
+start, 1,000-step horizon). Adding q to the MLP changed return by −0.00158
+(paired CI [−0.02097, +0.01780]), so it did not help in this seed. GRU beat
+the true-q VI policy by +0.03853 (paired CI [+0.01546, +0.06160]) and the
+q-observed MLP by +0.46792 ([+0.44548, +0.49036]). The exact q-aware VI result
+shows the MLP's low score is a training outcome, not a ceiling imposed by its
+feedforward inputs. These intervals represent rollout variation, not
+training-seed uncertainty; the experiment uses one training seed.
+
+An initial q-aware MLP run used the true product state's legal-action mask as
+well as q and scored 0.21210. Since it changed both the observation and the
+action interface, it is only an exploratory diagnostic; its data remain in
+`artifacts/pomdp_automaton_state_ablation/evaluation.json`. The controlled
+comparison, full 5×4 per-start return tables, exact timings, and analysis are
+in [POMDP_AUTOMATON_STATE_ABLATION.md](POMDP_AUTOMATON_STATE_ABLATION.md).
+The [notebook-style return grids and action/Q maps](artifacts/pomdp_automaton_state_ablation/index.md)
+show where the policies succeed on the task layout. Raw matched rollout data
+are in [evaluation_q_observed.json](artifacts/pomdp_automaton_state_ablation/evaluation_q_observed.json).

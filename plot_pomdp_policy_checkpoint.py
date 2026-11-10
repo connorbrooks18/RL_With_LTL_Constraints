@@ -64,7 +64,7 @@ def observation_distribution(mdp, position, error_probability):
     return distribution
 
 
-def encoded_input(csrl, observation, model, metadata, repeat_count):
+def encoded_input(csrl, observation, model, metadata, repeat_count, q=None):
     pair, row, col = observation
     if metadata["architecture"] in ("gru", "rssm"):
         if repeat_count == 1:
@@ -81,10 +81,21 @@ def encoded_input(csrl, observation, model, metadata, repeat_count):
             epsilon_commitment_mode=metadata.get("recurrent_epsilon_commitment_mode", "none"),
         ).unsqueeze(0)
 
-    factors = (csrl.shape[0], csrl.mdp.shape[0], csrl.mdp.shape[1])
+    observes_q = (
+        not metadata.get("partial_observation", True)
+        or metadata.get("automaton_state_observed", False)
+    )
+    if observes_q:
+        factors = tuple(csrl.shape[:-1])
+        if q is None:
+            raise ValueError("A product-state observation requires an automaton state")
+        coordinates = (pair, q, row, col)
+    else:
+        factors = (csrl.shape[0], csrl.mdp.shape[0], csrl.mdp.shape[1])
+        coordinates = (pair, row, col)
     vector = torch.zeros(int(metadata["n_observations"]), dtype=torch.float32)
     offset = 0
-    for coordinate, size in zip((pair, row, col), factors):
+    for coordinate, size in zip(coordinates, factors):
         vector[offset + int(coordinate)] = 1.0
         offset += size
     return vector.unsqueeze(0)
@@ -101,6 +112,10 @@ def evaluate_panel(model, metadata, grid, oa, csrl, pair, repeat_count):
         for outgoing in oa.eps for target in outgoing
     })
     allowed_actions = list(range(grid_action_count)) + epsilon_actions
+    observes_q = (
+        not metadata.get("partial_observation", True)
+        or metadata.get("automaton_state_observed", False)
+    )
     for row, col in grid.states():
         if grid.structure[row, col] == "B":
             continue
@@ -110,10 +125,17 @@ def evaluate_panel(model, metadata, grid, oa, csrl, pair, repeat_count):
         for observed_position, probability in observation_distribution(
                 grid, (row, col), error_probability).items():
             observation = (pair, observed_position[0], observed_position[1])
-            encoded = encoded_input(csrl, observation, model, metadata, repeat_count)
+            encoded = encoded_input(
+                csrl, observation, model, metadata, repeat_count,
+                q=oa.q0 if observes_q else None,
+            )
             with torch.no_grad():
                 q_values = model(encoded).squeeze(0).cpu().numpy()
-            action = max(allowed_actions, key=lambda candidate: q_values[candidate])
+            if not metadata.get("partial_observation", True):
+                allowed = list(csrl.A[(pair, oa.q0, row, col)])
+            else:
+                allowed = allowed_actions
+            action = max(allowed, key=lambda candidate: q_values[candidate])
             expected_q += probability * float(q_values[action])
             action_probabilities[action] = action_probabilities.get(action, 0.0) + probability
         best_action = max(action_probabilities, key=action_probabilities.get)
@@ -178,6 +200,9 @@ def plot_checkpoint(checkpoint_path: Path, output_path: Path, pair: int = 0):
                        default=1.0)
     for ax, count, (q_map, action_modes, _probs) in zip(axes[0], repeats, panels):
         label = "cold start (one observation)" if count == 1 else "same observation repeated four times"
+        if (metadata["architecture"] == "mlp"
+                and metadata.get("automaton_state_observed", False)):
+            label = "q₀ known; noisy physical position"
         draw_panel(ax, grid, q_map, action_modes,
                    f"{metadata['architecture'].upper()} policy: {label}", shared_limit)
     fig.suptitle(

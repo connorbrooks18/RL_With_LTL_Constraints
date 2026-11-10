@@ -136,7 +136,7 @@ class ControlSynthesis:
         return (i, q, observed_r, observed_c)
 
     def observe_observation(self, state, error_prob=None):
-        """Return the visible observation ``(pair, row, column)``.
+        """Return the visible ``(Rabin-pair index, row, column)`` observation.
 
         The true automaton state is intentionally omitted. Rewards and
         product-state transitions continue to use the true state.
@@ -149,8 +149,9 @@ class ControlSynthesis:
                            previous_action=None, recurrent=False):
         """One-hot encode an observation for a DQN or recurrent DQN.
 
-        For partial observations, pass ``(pair, row, column)``. For full
-        product-state observations, pass ``(pair, q, row, column)``. Recurrent
+        For partial observations, pass ``(Rabin-pair index, row, column)``.
+        For full product-state observations, pass
+        ``(Rabin-pair index, q, row, column)``. Recurrent
         tokens append a valid-token bit and, when present, the preceding action
         as a one-hot vector. Left-padding tokens are all zeros; the history
         encoder appends persistent one-hot epsilon-target memory separately.
@@ -158,11 +159,11 @@ class ControlSynthesis:
         observation = tuple(map(int, observation))
         if partial_observation:
             if len(observation) != 3:
-                raise ValueError("Partial observations must be (pair, row, column)")
+                raise ValueError("Partial observations must be (pair index, row, column)")
             factors = (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
         else:
             if len(observation) != 4:
-                raise ValueError("Product observations must be (pair, q, row, column)")
+                raise ValueError("Product observations must be (pair index, q, row, column)")
             factors = self.shape[:-1]
 
         feature_count = sum(factors) + (1 + self.shape[-1] if recurrent else 0)
@@ -515,6 +516,7 @@ class ControlSynthesis:
                         target_update_every=250,
                         checkpoint_dir="checkpoints", history_length=5,
                         gru_hidden_size=64, partial_observation=None,
+                        automaton_state_observed=False,
                         return_model=False, metadata_extra=None,
                         freeze_gru_after_episodes=None,
                         additional_checkpoint_episodes=None,
@@ -593,9 +595,15 @@ class ControlSynthesis:
                 recurrent_architecture or self.mdp.observation_error > 0.0
             )
         partial_observation = bool(partial_observation)
+        automaton_state_observed = bool(automaton_state_observed)
+        if automaton_state_observed and (not partial_observation or recurrent_architecture):
+            raise ValueError(
+                "automaton_state_observed requires a feedforward partial-action policy"
+            )
         observation_factors = (
-            (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
-            if partial_observation else self.shape[:-1]
+            self.shape[:-1]
+            if (not partial_observation or automaton_state_observed)
+            else (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
         )
         if architecture == "linear":
             # One independent output vector for each observation, or each
@@ -686,7 +694,7 @@ class ControlSynthesis:
         criterion = nn.SmoothL1Loss()
 
         def encode_state(s, *, error_prob=None, previous_action=None):
-            if partial_observation:
+            if partial_observation and not automaton_state_observed:
                 observation = self.observe_observation(s, error_prob)
             else:
                 observation = self.observe_state(s, error_prob)
@@ -1242,10 +1250,11 @@ class ControlSynthesis:
                 "n_actions": int(n_actions),
                 "hidden_size": hidden_size,
                 "partial_observation": partial_observation,
+                "automaton_state_observed": automaton_state_observed,
                 "observation_encoding": (
-                    "pair,row,column; automaton state hidden"
-                    if partial_observation else
-                    "pair,automaton state,row,column"
+                    "Rabin-pair index,row,column; automaton state hidden"
+                    if partial_observation and not automaton_state_observed else
+                    "Rabin-pair index,automaton state,row,column"
                 ),
                 "history_length": int(history_length) if recurrent_architecture else None,
                 "gru_hidden_size": int(gru_hidden_size) if architecture == "gru" else None,
@@ -1267,7 +1276,9 @@ class ControlSynthesis:
                 ),
                 "epsilon_commit_mask_from_history": epsilon_commit_mask_supported,
                 "rejecting_sink_target_semantics": (
-                    "zero bootstrap on proven rejecting-sink transitions; hidden q is not a policy input"
+                    "zero bootstrap on proven rejecting-sink transitions; "
+                    + ("q is a policy input" if automaton_state_observed or not partial_observation
+                       else "q is hidden from the policy input")
                 ),
                 "q_table_semantics": (
                     "cold-start history with one clean current observation"

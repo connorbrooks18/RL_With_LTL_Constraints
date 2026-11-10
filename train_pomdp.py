@@ -45,6 +45,11 @@ def main() -> None:
         "--architecture", choices=("gru", "rssm", "mlp"), default="gru",
         help="gru and rssm use an observation history; mlp is feedforward",
     )
+    parser.add_argument(
+        "--reveal-automaton-state", action="store_true",
+        help=("for an MLP, include the true automaton state with the noisy "
+              "position while retaining the partial-observation action interface"),
+    )
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -63,11 +68,15 @@ def main() -> None:
         help="save intermediate policy snapshots at these episode counts",
     )
     args = parser.parse_args()
+    if args.reveal_automaton_state and args.architecture != "mlp":
+        parser.error("--reveal-automaton-state is only valid with --architecture mlp")
     if args.checkpoint_dir is None:
         if args.architecture in ("gru", "rssm"):
             args.checkpoint_dir = (
                 f"checkpoints_pomdp_{args.architecture}_history{args.history_length}_seed{args.seed}"
             )
+        elif args.reveal_automaton_state:
+            args.checkpoint_dir = f"checkpoints_pomdp_mlp_q_observed_seed{args.seed}"
         else:
             args.checkpoint_dir = f"checkpoints_pomdp_mlp_seed{args.seed}"
 
@@ -92,7 +101,8 @@ def main() -> None:
     print(
         f"Starting POMDP {args.architecture.upper()}-DQN run:",
         f"episodes={args.episodes}, horizon={args.horizon},",
-        f"architecture={args.architecture}, history={args.history_length}, seed={args.seed}",
+        f"architecture={args.architecture}, history={args.history_length}, "
+        f"automaton_state_observed={args.reveal_automaton_state}, seed={args.seed}",
         flush=True,
     )
     progress_checkpoints = args.checkpoint_episodes or (
@@ -111,6 +121,7 @@ def main() -> None:
         history_length=args.history_length,
         gru_hidden_size=64,
         partial_observation=True,
+        automaton_state_observed=args.reveal_automaton_state,
         batch_size=args.batch_size,
         replay_update_every=args.replay_update_every,
         replay_capacity=args.replay_capacity,
@@ -120,6 +131,10 @@ def main() -> None:
         return_model=True,
         freeze_gru_after_episodes=args.freeze_gru_after_episodes,
         additional_checkpoint_episodes=progress_checkpoints,
+        metadata_extra={
+            "automaton_state_observed": bool(args.reveal_automaton_state),
+            "position_observation_error": float(grid_mdp.observation_error),
+        },
         rssm_deterministic_size=args.rssm_hidden_size,
         rssm_stochastic_variables=args.rssm_stochastic_variables,
         rssm_categorical_classes=args.rssm_categorical_classes,
