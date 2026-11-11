@@ -72,7 +72,9 @@ def _rollout(csrl, start, rollout_seed, horizon, model, metadata):
     np.random.seed(int(rollout_seed))
     transition_rng = np.random.default_rng(int(rollout_seed) + 1)
     state = (0, csrl.oa.q0, int(start[0]), int(start[1]))
-    observation = csrl.observe_observation(state)
+    automaton_state_observed = bool(metadata.get("automaton_state_observed", False))
+    observe = csrl.observe_state if automaton_state_observed else csrl.observe_observation
+    observation = observe(state)
     observations = [observation]
     previous_actions = [None]
     epsilon_target = None
@@ -85,7 +87,10 @@ def _rollout(csrl, start, rollout_seed, horizon, model, metadata):
         for target in outgoing
     })
     global_actions = list(range(grid_action_count)) + epsilon_actions
-    factors = (csrl.shape[0], csrl.mdp.shape[0], csrl.mdp.shape[1])
+    factors = (
+        tuple(csrl.shape[:-1]) if automaton_state_observed else
+        (csrl.shape[0], csrl.mdp.shape[0], csrl.mdp.shape[1])
+    )
 
     for _ in range(horizon):
         if metadata["architecture"] == "gru":
@@ -94,15 +99,19 @@ def _rollout(csrl, start, rollout_seed, horizon, model, metadata):
                 history_length=int(metadata["history_length"]),
                 previous_actions=previous_actions,
                 partial_observation=True,
+                automaton_state_observed=automaton_state_observed,
                 epsilon_committed=epsilon_target is not None,
                 epsilon_target=epsilon_target,
                 epsilon_commitment_mode=metadata.get(
                     "recurrent_epsilon_commitment_mode", "target_one_hot"
                 ),
             ).unsqueeze(0)
-            allowed = (list(range(grid_action_count))
-                       if metadata.get("epsilon_commit_mask_from_history", False)
-                       and epsilon_target is not None else global_actions)
+            if automaton_state_observed:
+                allowed = csrl.actions_for_observed_q(state[1])
+            else:
+                allowed = (list(range(grid_action_count))
+                           if metadata.get("epsilon_commit_mask_from_history", False)
+                           and epsilon_target is not None else global_actions)
         else:
             encoded = torch.zeros(int(metadata["n_observations"]), dtype=torch.float32)
             offset = 0
@@ -110,8 +119,9 @@ def _rollout(csrl, start, rollout_seed, horizon, model, metadata):
                 encoded[offset + int(coordinate)] = 1.0
                 offset += size
             encoded = encoded.unsqueeze(0)
-            # Feedforward training uses the observation-independent global action mask.
-            allowed = global_actions
+            # The q-aware mask reveals only epsilon availability from observed q.
+            allowed = (csrl.actions_for_observed_q(state[1])
+                       if automaton_state_observed else global_actions)
 
         with torch.no_grad():
             q_values = model(encoded).squeeze(0).cpu().numpy()
@@ -132,7 +142,7 @@ def _rollout(csrl, start, rollout_seed, horizon, model, metadata):
 
         if metadata["architecture"] == "gru" and action in epsilon_actions and epsilon_target is None:
             epsilon_target = action - grid_action_count
-        observation = csrl.observe_observation(state)
+        observation = observe(state)
         if metadata["architecture"] == "gru":
             observations.append(observation)
             previous_actions.append(action)
@@ -152,7 +162,11 @@ def evaluate_pair(gru_path, no_gru_path, *, runs, horizon, seed):
     if gru_meta["environment_steps"] != no_gru_meta["environment_steps"]:
         raise ValueError("GRU and no-GRU checkpoints must have the same training step budget")
     if not gru_meta.get("partial_observation") or not no_gru_meta.get("partial_observation"):
-        raise ValueError("Both checkpoints must hide the true product-state components")
+        raise ValueError("Both checkpoints must retain a partially observed grid state")
+    if bool(gru_meta.get("automaton_state_observed", False)) != bool(
+        no_gru_meta.get("automaton_state_observed", False)
+    ):
+        raise ValueError("GRU and no-GRU checkpoints must agree on q visibility")
     if gru_meta.get("observation_encoding") != no_gru_meta.get("observation_encoding"):
         raise ValueError("GRU and no-GRU checkpoints must use the same observation fields")
     if gru_meta.get("start_sampling") != no_gru_meta.get("start_sampling"):
@@ -202,6 +216,9 @@ def evaluate_pair(gru_path, no_gru_path, *, runs, horizon, seed):
         "no_gru_episodes": int(no_gru_meta["episodes"]),
         "environment_steps": int(gru_meta["environment_steps"]),
         "history_length": int(gru_meta["history_length"]),
+        "automaton_state_observed": bool(
+            gru_meta.get("automaton_state_observed", False)
+        ),
         "no_gru_architecture": no_gru_meta["architecture"],
         "evaluation_seed": int(seed),
         "rollouts_per_start": int(runs),
@@ -273,10 +290,24 @@ def main():
                 print(f"Seed {training_seed}: GRU − no-GRU {result['mean']:.6f} "
                       f"(95% rollout CI {lo:.6f}, {hi:.6f})", flush=True)
     reports = [reports_by_seed[seed] for seed in sorted(reports_by_seed)]
+    q_is_observed = bool(reports[0].get("automaton_state_observed", False))
+    baseline_definition = (
+        "Feedforward MLP DQN receives only the current (Rabin-pair index, true "
+        "automaton state q, noisy row, noisy column) observation; the GRU sees "
+        "a four-observation history. Both retain partial grid-position "
+        "observability and use the same q-derived action mask."
+        if q_is_observed else
+        "Feedforward MLP DQN receives only the current noisy (Rabin-pair index, "
+        "row, column) observation. The task automaton state is hidden from both "
+        "policies, and no observation history, previous action, or recurrent "
+        "state is supplied to the MLP."
+    )
 
     output = {
-        "comparison": "partial-observation GRU-DQN history-4 versus feedforward no-GRU DQN",
-        "baseline_definition": "Feedforward MLP DQN receives only the current noisy (task-pair, row, column) observation. The task automaton state is hidden from both policies, and no observation history, previous action, or recurrent state is supplied to the MLP.",
+        "comparison": "partially observed grid: history-4 GRU-DQN versus feedforward current-observation DQN",
+        "automaton_state_observed": q_is_observed,
+        "grid_position_partially_observed": True,
+        "baseline_definition": baseline_definition,
         "runs": reports,
         "across_training_seeds": _aggregate(reports),
     }

@@ -1,166 +1,197 @@
-# Section One: experiments and results
+# Section One: recurrent Q learning with partial grid observability
 
-## Executive summary
+## Research question
 
-This report brings together the completed partially observable grid, office
-transfer, GRU-freezing, and RSSM-DQN experiments. The headline results are:
+Can a deep recurrent Q network learn a motion-planning policy for a temporal
+logic task when grid position is uncertain? Does a history-4 GRU-DQN improve
+over a feedforward DQN that sees only the latest reading? Can freezing the
+GRU or learning an RSSM encoder reduce training time while retaining policy
+quality?
 
-| Study | Main result | Scope |
-|:--|:--|:--|
-| History-4 GRU versus no-history MLP | GRU mean return 0.513 versus 0.086; paired gain +0.427 (95% CI +0.348 to +0.506). GRU won on all 10 matched training seeds. | 15k episodes per seed; 10 seeds |
-| History-4 GRU versus noisy-input MDP value iteration | Paired gain +0.114 (95% CI +0.028 to +0.201); GRU won on 9/10 seeds. | Same task and 10 seeds |
-| Training-length check | Mean return rose through 45k, then was 0.033 lower at 90k; the four-seed interval included no change. | 15k–90k; 4 seeds |
-| One-agent office transfer | Mean probability of completing at least two safe LTL cycles: 0.114 (95% CI 0.004–0.224). | 10k episodes; 7 seeds |
-| GRU freezing | Saved about 9% wall time across nine paired seeds; quality preservation was inconclusive under the registered margin. | 15k episodes; 9 seeds |
-| RSSM-inspired encoder into DQN | Best checkpoint returned 0.359 after 7.57 minutes; below the strongest GRU checkpoints and noisy-input VI. | 5k-episode pilot; 1 seed |
-| Automaton-state input ablation | True q alone did not rescue the MLP (0.104); GRU scored 0.572 and true-q VI 0.533. | Matched seed 17; 1,900 common rollout scenarios |
+This report covers the two experiment sets selected for Section One. The agent
+always receives the true current automaton state `q`; only grid position is
+partially observed. Older office-transfer, training-length, q-ablation, and
+q-hidden pilot workflows were removed from this repository and are not part
+of these results.
 
-The strongest supported Section One claim is specific: a history-4 GRU-DQN
-trained on partial observations substantially improves over a matched
-no-history DQN and improves over regular MDP value iteration when that policy
-is indexed using noisy observations. The office experiment provides
-seven-seed transfer evidence with modest success rates and wide seed
-variation. GRU freezing saves time, but the confirmatory quality result is
-inconclusive. The RSSM run is a compact-model feasibility pilot, not evidence
-that an RSSM encoder matches GRU quality.
+## Environment and model inputs
 
-## Visual guide
+A single agent acts in the project 5×4 grid under `(F G a | F G b) & G !c`.
+The noisy position channel has error probability 0.25. All learned policies
+receive the current Rabin-pair index, true automaton state `q`, and noisy row
+and column. They share a q-derived legal-action mask; none receives true grid
+coordinates, hidden labels, or a hidden product state.
 
-The [notebook-style grid gallery](artifacts/research_summary/grid_visualizations/index.md)
-contains 23 grid figures rendered through the same `GridMDP.plot` code used in
-the notebooks. Numbers show empirical discounted returns from each start
-square or paired differences by square. They are not learned scalar state
-values. The original grid labels, walls, traps, axes, and visual conventions
-are retained.
+The GRU receives the latest four observations and preceding actions. It has one
+64-unit recurrent layer, 17,608 total parameters, including a 520-parameter Q
+head. The feedforward comparison is a two-hidden-layer, 64-unit MLP with
+5,640 parameters. The MLP receives only the current observation. The compact
+RSSM has a 16-unit deterministic state and two 4-class categorical variables,
+with 3,111 total parameters. Its auxiliary observation, reward, and KL loss
+weights are 0.1, 0.1, and 0.01; its encoder is trained jointly with the DQN.
+The frozen-GRU arm updates the GRU and Q head through episode 10,000, then
+freezes the GRU and updates only the Q head.
 
-### Core partially observable task
+The experiment scale follows Li (2024), Chapter 4, §4.5.1, Task 1, loosely:
+the task and 15,000 × 600 training budget are similar, while the environment,
+observation channel, four-step history, GRU/RSSM architecture, and other
+settings remain those of this project. This is not a reproduction of the
+thesis. [Thesis record](https://doi.org/10.25820/etd.007512).
 
-The main comparison trains a history-4 GRU-DQN and a matched no-history MLP
-for 15,000 episodes × 600 steps on the 5×4 task. Evaluation uses 100 rollouts
-from each of 19 traversable starts and a 1,000-step horizon. The automaton
-state is hidden from both learned policies.
+## Shared training protocol
 
-![Paired ten-seed GRU and no-history MLP comparison](artifacts/pomdp_policy_maps/gru_vs_mlp_10seeds.png)
+| Setting | Value |
+|:--|:--|
+| Training seeds | 17, 18, 19, 20, 21 |
+| Episodes × maximum steps | 15,000 × 600 per run |
+| Environment steps | 9,000,000 per run |
+| Batch size | 32 |
+| Optimizer learning rate | 1e-4 |
+| Replay capacity | 100,000 |
+| Replay update interval | Every 4 environment steps |
+| Target network update | Every 50 environment steps |
+| Exploration | Linear 1.0 → 0.1 over first 25% of episodes, then 0.1 |
+| Automaton action probability | 0.2 |
+| Discounts | 0.99999 nonaccepting; 0.99 accepting |
+| Execution | Serial, one training process at a time |
 
-![GRU-DQN versus MDP value iteration indexed by noisy observations](artifacts/pomdp_policy_maps/gru_vs_noisy_mdp_vi_10seeds.png)
+Across-seed confidence intervals use the five training seeds as independent
+replicates. Rollouts within a trained policy are paired samples, not additional
+training seeds.
 
-![Ten-seed training return curves](artifacts/pomdp_policy_maps/training_returns_10seeds.png)
+## Experiment 1: history-4 GRU versus current-observation MLP
 
-The per-start return grids provide the problem-layout view: [GRU](artifacts/research_summary/grid_visualizations/gru_15k_10seeds.png),
-[no-history MLP](artifacts/research_summary/grid_visualizations/mlp_15k_10seeds.png),
-[noisy-input MDP value iteration](artifacts/research_summary/grid_visualizations/noisy_vi_10seeds.png),
-[full-state MDP reference](artifacts/research_summary/grid_visualizations/full_state_vi_10seeds.png),
-[GRU minus MLP](artifacts/research_summary/grid_visualizations/gru_minus_mlp_by_start.png),
-and [GRU minus noisy-input VI](artifacts/research_summary/grid_visualizations/gru_minus_noisy_vi_by_start.png).
+Each model was evaluated greedily from all 19 traversable starts, using 100
+common rollouts per start and a 1,000-step horizon. Mean discounted return:
 
-The ten-seed mean returns were 0.51331 for GRU-DQN, 0.08625 for the MLP, and
-0.39890 for noisy-input MDP value iteration. The full-state MDP policy scored
-0.76462 and is an oracle reference. The paired GRU-minus-MLP gain was +0.42706
-(95% Student-t CI [+0.34780, +0.50632]); all ten seeds favored the GRU. The
-paired gain over noisy-input VI was +0.11441 (95% CI [+0.02821, +0.20062]);
-nine of ten seeds favored the GRU. This does not compare against a belief-state
-POMDP solver.
+| Policy | Mean | 95% interval across training seeds |
+|:--|--:|:--:|
+| History-4 GRU-DQN | 0.5250 | [0.3991, 0.6509] |
+| Current-observation MLP-DQN | 0.3236 | [0.2196, 0.4276] |
+| Paired GRU − MLP | **+0.2014** | **[+0.0763, +0.3265]** |
 
-### Training length
+| Training seed | GRU return | MLP return | GRU − MLP |
+|---:|---:|---:|---:|
+| 17 | 0.4845 | 0.2105 | +0.2739 |
+| 18 | 0.5115 | 0.2890 | +0.2225 |
+| 19 | 0.6612 | 0.3517 | +0.3095 |
+| 20 | 0.3907 | 0.3279 | +0.0628 |
+| 21 | 0.5771 | 0.4389 | +0.1382 |
 
-Four matched seeds were evaluated at 15k, 30k, 45k, and 90k episodes. The
-training-length plot is below; per-start grids for the longer checkpoints are
-available in the [grid gallery](artifacts/research_summary/grid_visualizations/index.md).
+The GRU won on all five seeds, and the paired interval is positive. This
+supports the claim that observation history and recurrence help over the
+matched current-observation DQN in this task, with `q` visible to both models.
 
-![Paired return by training length, 15k to 90k episodes](artifacts/pomdp_policy_maps/training_length_15k_30k_45k_90k_seeds17_20.png)
+### Same-grid per-start empirical returns
 
-Mean returns were 0.482, 0.541, 0.585, and 0.552 at those budgets. The paired
-45k-to-90k change was −0.033 (95% CI [−0.161, +0.095]). The endpoint data do
-not establish a length benefit or convergence.
+The entries in each cell are ordered **GRU / MLP / frozen GRU / RSSM / noisy
+input VI**. They are empirical discounted returns from that start, not a
+learned scalar state-value function. `B` is a wall, `T` marks a trap, and the
+letters are proposition labels.
 
-### Transfer to the one-agent office environment
+| Row / column | 0 | 1 | 2 | 3 |
+|:--|:--|:--|:--|:--|
+| 0 | 0.30 / 0.25 / 0.15 / 0.27 / 0.60 | 0.27 / 0.24 / 0.12 / 0.25 / 0.59 | c · 0.00 / 0.00 / 0.00 / 0.00 / 0.00 | 0.78 / 0.17 / 0.80 / 0.74 / 0.29 |
+| 1 | 0.35 / 0.28 / 0.12 / 0.28 / 0.63 | 0.35 / 0.31 / 0.17 / 0.28 / 0.54 | a · 0.51 / 0.18 / 0.36 / 0.30 / 0.64 | b/T · 1.00 / 1.00 / 1.00 / 1.00 / 1.00 |
+| 2 | B | 0.49 / 0.36 / 0.21 / 0.41 / 0.62 | c · 0.00 / 0.00 / 0.00 / 0.00 / 0.00 | 0.82 / 0.42 / 0.83 / 0.83 / 0.64 |
+| 3 | b/T · 1.00 / 0.80 / 1.00 / 1.00 / 1.00 | 0.62 / 0.53 / 0.73 / 0.63 / 0.50 | a/T · 1.00 / 1.00 / 1.00 / 1.00 / 1.00 | 0.88 / 0.60 / 0.85 / 0.93 / 0.71 |
+| 4 | 0.88 / 0.00 / 0.88 / 0.86 / 0.63 | c · 0.00 / 0.00 / 0.00 / 0.00 / 0.00 | 0.74 / 0.00 / 0.76 / 0.77 / 0.74 | c · 0.00 / 0.00 / 0.00 / 0.00 / 0.00 |
 
-The office experiment uses the thesis office layout and an analytical
-observation rule based on complete local wall-signature uniqueness. It trains
-history-4 GRU-DQN for 10,000 episodes × 300 steps across seven seeds.
+The corresponding notebook-style maps for each policy, VI, and the paired
+differences are retained as local experiment outputs; the numeric table above
+is included directly so the repository documentation remains self-contained.
 
-![Office mean return, accepted cycles, and safe two-cycle probability on the 4×4 map](artifacts/office_policy_maps/office_gamma098_grid_7seeds.png)
+### Ordinary MDP value-iteration reference
 
-![Office training-return curves](artifacts/office_policy_maps/training_returns_gamma098_7seeds.png)
+We evaluated product-MDP value iteration with true `q`, but supplied noisy row
+and column as if they were the current grid state. This is a regular MDP policy
+indexed by a noisy state reading, not a belief-state POMDP solver. Its mean
+return was 0.5331. The paired GRU-minus-VI difference was −0.0081 (95%
+interval −0.1340 to +0.1178); GRU was higher on two of five seeds. The study
+does not establish GRU superiority over value iteration.
 
-The across-seed probability of completing at least two safe LTL cycles was
-0.114 (95% Student-t CI [0.004, 0.224]). The result supports transfer, with
-substantial variability and modest success rates; it does not show dependable
-high success from every training seed. The [office policy maps and routes](EXPERIMENTS.md#experiment-2-transfer-to-lis-office-environment)
-show individual behaviors.
+## Experiment 2: training time and convergence
 
-### Freezing the GRU encoder
+The full-GRU arm reuses Experiment 1 checkpoints. The frozen-GRU and RSSM
+arms were trained on the same five seeds and budgets. Policies were evaluated
+at 10,000, 12,500, and 15,000 episodes using 20 common rollouts per start and
+a 500-step horizon. Final policies were evaluated again using 100 rollouts
+per start and a 1,000-step horizon. The quality-preservation margin was −0.05
+return points; its paired 95% interval had to lie above −0.05 to support a
+faster-at-comparable-quality claim.
 
-The nine-seed confirmatory study trained full GRU-DQN for 15k episodes and
-compared it with a policy trained jointly through 10k, then head-only through
-15k. The paired return difference (frozen minus full) was −0.006 (95%
-Student-t CI [−0.136, +0.124]); this does not satisfy the predeclared
-non-inferiority margin of −0.05. Mean wall time fell from 2,331.979 s to
-2,122.160 s, saving 209.820 s per run (9.00%; 95% CI 8.80%–9.19%).
+### Final quality and measured training time
 
-![Confirmatory frozen-GRU comparison](artifacts/gru_freeze_ab/confirmatory_10k/comparison.png)
+| Policy | Mean return | Difference vs full GRU (95% interval) | Mean training-loop seconds |
+|:--|--:|:--:|--:|
+| Full GRU | 0.5250 | reference | 3,651 |
+| Frozen after 10k | 0.4733 | −0.0517 [−0.1919, +0.0885] | 2,148 |
+| RSSM encoder | 0.5028 | −0.0222 [−0.1687, +0.1244] | 3,977 |
 
-![Per-start paired frozen-minus-full return difference](artifacts/research_summary/grid_visualizations/freeze_frozen_minus_full_15k_by_start.png)
+Freezing saved a paired mean of 1,503 training-loop seconds (95% interval
++225 to +2,781). Its final quality interval did not pass the −0.05 margin.
+RSSM's paired time saving was −326 seconds (95% interval −1,646 to +994),
+and its quality interval also did not establish non-inferiority. Therefore,
+freezing reduced observed time in this campaign, but no method was shown to
+train faster at comparable final quality.
 
-A seed-27 direct-stop run stopped at 12.5k after freezing at 10k and saved
-24.35% wall time against a 15k full-GRU run. Its paired rollout return gain
-was +0.097, but this is one seed. In the separate 25k extension, frozen GRU
-scored 0.454 at 20k versus 0.414 for full GRU at 25k, then declined to 0.328
-at frozen 25k. The evidence favors choosing a measured stop point over
-continuing head-only training indefinitely, but does not establish
-cross-seed quality preservation.
+### Checkpoint convergence
 
-![Frozen-GRU return trajectory through 25k episodes](artifacts/gru_freeze_ab/convergence_25k/convergence.png)
+| Episodes | Full GRU return (95% interval) | Frozen GRU return (95% interval) | RSSM return (95% interval) |
+|---:|:--:|:--:|:--:|
+| 10,000 | 0.428 [0.390, 0.465] | 0.428 [0.390, 0.465] | 0.469 [0.320, 0.619] |
+| 12,500 | 0.501 [0.385, 0.618] | 0.447 [0.392, 0.503] | 0.426 [0.330, 0.521] |
+| 15,000 | 0.468 [0.366, 0.570] | 0.440 [0.407, 0.472] | 0.464 [0.349, 0.580] |
 
-The [freeze checkpoint return grids](artifacts/research_summary/grid_visualizations/index.md),
-[policy-map index](artifacts/gru_freeze_ab/convergence_25k/policies/index.md),
-and [full freeze protocol](GRU_FREEZE_EXPERIMENT.md) contain the remaining
-visual and run-level detail.
+The frozen 10k checkpoint is the same weights as the full GRU 10k checkpoint.
+At 15k, paired 20-rollout differences versus full GRU were −0.0279 (95%
+interval −0.1318 to +0.0760) for frozen and −0.0034 (−0.0990 to +0.0921)
+for RSSM. Using the descriptive rule “first saved checkpoint reaching 90%
+of that seed's full-GRU 15k return,” frozen reached the threshold in 3/5
+seeds at mean 1,552 seconds; RSSM in 4/5 at mean 2,609 seconds. This is coarse
+because checkpoints were saved at only three budgets.
 
-### RSSM-inspired encoder feeding DQN
+## Training wall-clock record
 
-The seed-27 RSSM pilot uses four-token histories, a 16-unit deterministic
-state, two four-class categorical latents, and a 2,979-parameter DQN model.
-Its best checkpoint was at 3,750 episodes (0.3589 return, 454.4 s training
-loop); return dropped to 0.1952 at 5,000 episodes. The best RSSM checkpoint
-was below full-GRU 25k (0.4142), frozen-GRU 20k (0.4542), and noisy-input VI
-(0.3989), but above frozen-GRU 25k (0.3275).
+Each successful run used 15,000 episodes. Process wall time divided by 15,000
+gives the seconds/episode values below. The trainer's loop timer differs from
+process time by only a few seconds per run.
 
-![Return versus training time for RSSM and GRU checkpoints](artifacts/rssm_dqn_pilot/return_vs_training_time.png)
+| Seed | Full GRU seconds (s/episode) | Frozen seconds (s/episode) | RSSM seconds (s/episode) |
+|---:|---:|---:|---:|
+| 17 | 4,402.9 (0.2935) | 2,104.5 (0.1403) | 3,959.9 (0.2640) |
+| 18 | 4,424.1 (0.2949) | 2,268.0 (0.1512) | 3,937.5 (0.2625) |
+| 19 | 4,418.5 (0.2946) | 2,128.6 (0.1419) | 4,014.6 (0.2676) |
+| 20 | 2,716.8 (0.1811) | 2,127.5 (0.1418) | 3,991.1 (0.2661) |
+| 21 | 2,308.0 (0.1539) | 2,123.8 (0.1416) | 3,990.7 (0.2660) |
+| **Mean** | **3,654.1 (0.2436)** | **2,150.5 (0.1434)** | **3,978.8 (0.2653)** |
 
-![RSSM and GRU training-return trajectories](artifacts/rssm_dqn_pilot/training_return_trajectories.png)
+Full-GRU throughput changed sharply: seeds 17–19 took about 4,400 seconds,
+while seeds 20–21 took 2,717 and 2,308 seconds. Full-GRU runs preceded all
+frozen/RSSM runs. Time-dependent machine load or throughput therefore
+confounds the apparent speed difference. The measured timings are retained,
+but a counterbalanced timing replication is needed for a strong causal claim.
 
-The per-cell RSSM and matched-GRU return figures are in the [notebook-style
-grid gallery](artifacts/research_summary/grid_visualizations/index.md).
-Noise-averaged greedy action and expected-Q maps for all seven checkpoints
-are in the [RSSM policy-map index](artifacts/rssm_dqn_pilot/policies/index.md).
-This is one training seed, the implementation is RSSM-inspired rather than a
-canonical RSSM, and the pilot used one eighth as many DQN updates per
-environment step as the GRU baseline. It is useful feasibility evidence, not
-an equal-update architecture comparison.
+Training used CPU on macOS 26.6.2, arm64 Apple Silicon, Python 3.14.2,
+PyTorch 2.14.0, and NumPy 2.5.2. Successful training ran serially from
+2026-11-10 20:15 UTC through 2026-11-11 12:11 UTC. Two early seed-17 GRU
+attempts were excluded: one stopped during protocol review after 793.9 seconds;
+a second stopped on a zero-length commitment tensor bug after 2.8 seconds,
+before saving a checkpoint.
 
-### Does the GRU receive the automaton state?
+| Evaluation job | UTC start | UTC finish | Wall seconds |
+|:--|:--|:--|--:|
+| GRU vs MLP | 2026-11-11 12:12 | 2026-11-11 12:29 | 1,013.5 |
+| Checkpoint convergence | 2026-11-11 12:29 | 2026-11-11 12:41 | 726.6 |
+| Final quality and VI | 2026-11-11 12:41 | 2026-11-11 13:24 | 2,582.1 |
+| Policy-map generation | 2026-11-11 13:24 | 2026-11-11 13:24 | 22.4 |
 
-No: the GRU receives recent noisy positions, previous actions, and memory of
-its own epsilon target, while the true automaton state remains hidden. The
-original MLP also hid q. In a controlled seed-17 follow-up, giving q to the MLP
-did not improve its return (0.104 versus 0.105 without q). Exact value
-iteration using true q and noisy position scored 0.533; the GRU scored 0.572
-on paired scenarios. This points to a learning failure in the q-aware MLP run,
-not a fundamental limit on feedforward policies. See the [full automaton-state
-ablation report](POMDP_AUTOMATON_STATE_ABLATION.md) and its [grid and action
-maps](artifacts/pomdp_automaton_state_ablation/index.md).
+## Conclusion
 
-## Full report and data
-
-- [Experiment 1 and office results, per-cell tables, and references](EXPERIMENTS.md)
-- [Section One research checkpoint](SECTION_ONE_CHECKPOINT.md)
-- [GRU-freezing design, timing, and seed-level results](GRU_FREEZE_EXPERIMENT.md)
-- [RSSM design, hyperparameters, wall times, paired results, and limitations](RSSM_DQN_PILOT.md)
-- [Automaton-state MLP and q-aware VI ablation](POMDP_AUTOMATON_STATE_ABLATION.md)
-- [All 23 notebook-style grid visuals](artifacts/research_summary/grid_visualizations/index.md)
-
-Machine-readable rollout reports and training manifests are linked from those
-experiment documents. Confidence intervals over rollout scenarios describe
-evaluation sampling; intervals across training seeds are identified
-separately. Single-seed follow-ups are labeled exploratory throughout.
+With true `q` and noisy grid coordinates, the history-4 GRU-DQN outperformed
+the matched current-observation MLP on all five seeds. This supports the
+recurrent architecture for this temporal-logic grid task. The GRU did not
+establish an advantage over q-aware noisy-input value iteration. Freezing
+reduced measured training time, but final quality preservation remains
+inconclusive and timing is confounded by run order. RSSM showed neither a
+reliable time saving nor established quality non-inferiority.

@@ -1,11 +1,25 @@
-For my undergraduate thesis at the University of Iowa, I am working with Prof. Shaoping Xiao on extending https://github.com/alperkamil/csrl to the POMDP case
+# Temporal-logic motion planning with partial observations
 
-The completed Section One experiments, results, and visual gallery are
-summarized in [RESEARCH_RESULTS_REPORT.md](RESEARCH_RESULTS_REPORT.md).
+This repository studies deep Q-learning for motion planning under temporal
+logic constraints. The current Section One experiments expose the true task
+automaton state `q` and keep grid position partially observable.
 
-Initial steps:
-  1. Tabular Q-learning -> approximate/neural network
-  2. MDP -> POMDP (but just use most recent observation)
-  3. GRU to handle observation history 
-  4. LSTM? Transformer? Something else?
-  5. Do a full model-based system with M(s_i, a_i) -> (s_{i+1}, r_{i+1})
+## Research results
+
+- [Section One research report](RESEARCH_RESULTS_REPORT.md): protocol,
+  outcomes, per-start 5×4 returns, wall-clock record, and limitations.
+- [Experiment protocol and reproduction commands](EXPERIMENTS.md).
+- [Current Section One checkpoint](SECTION_ONE_CHECKPOINT.md).
+
+## Core implementation
+
+- `controlsyn.py`: product MDP construction and DQN training.
+- `dqn.py`: MLP-DQN, GRU-DQN, and RSSM-DQN.
+- `train_pomdp.py`: serially invoked POMDP experiment runner. Pass
+  `--reveal-automaton-state` to observe `q`; grid observations remain noisy.
+- `evaluate_pomdp.py`, `evaluate_pomdp_gru_vs_no_gru.py`, and
+  `evaluate_pomdp_vs_value_iteration.py`: policy and baseline evaluation.
+- `plot_pomdp_policy_checkpoint.py`: notebook-style policy and action maps.
+
+Run metadata, checkpoints, and generated figures are stored locally under
+ignored `artifacts/` and `checkpoints_*/` directories.

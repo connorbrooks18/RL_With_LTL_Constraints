@@ -83,9 +83,14 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
         build_environment(float(metadata["observation_error"]))
     )
     if metadata["architecture"] == "rssm":
+        observation_factors = (
+            tuple(csrl.shape[:-1])
+            if metadata.get("automaton_state_observed", False)
+            else (csrl.shape[0], grid.shape[0], grid.shape[1])
+        )
         model = RSSMDQN(
             metadata["n_observations"], metadata["n_actions"],
-            (csrl.shape[0], grid.shape[0], grid.shape[1]),
+            observation_factors,
             hidden_size=metadata["rssm_deterministic_size"],
             stochastic_variables=metadata["rssm_stochastic_variables"],
             categorical_classes=metadata["rssm_categorical_classes"],
@@ -102,6 +107,7 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
     history_length = int(metadata["history_length"])
     commitment_mode = metadata.get("recurrent_epsilon_commitment_mode", "none")
     use_commit_mask = bool(metadata.get("epsilon_commit_mask_from_history", False))
+    automaton_state_observed = bool(metadata.get("automaton_state_observed", False))
 
     start_results = []
     for start_index, (start_row, start_col) in enumerate(valid_starts):
@@ -118,7 +124,8 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
 
         for rollout in range(n_runs):
             state = start_state
-            observations = [csrl.observe_observation(state)]
+            observe = csrl.observe_state if automaton_state_observed else csrl.observe_observation
+            observations = [observe(state)]
             previous_actions = [None]
             epsilon_target = None
             total_return = 0.0
@@ -130,17 +137,21 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
                     history_length=history_length,
                     previous_actions=previous_actions,
                     partial_observation=True,
+                    automaton_state_observed=automaton_state_observed,
                     epsilon_committed=epsilon_target is not None,
                     epsilon_target=epsilon_target,
                     epsilon_commitment_mode=commitment_mode,
                 ).unsqueeze(0)
                 with torch.no_grad():
                     values = model(history).squeeze(0).cpu().numpy()
-                allowed = (
-                    list(range(len(grid.A)))
-                    if use_commit_mask and epsilon_target is not None
-                    else global_actions
-                )
+                if automaton_state_observed:
+                    allowed = csrl.actions_for_observed_q(state[1])
+                else:
+                    allowed = (
+                        list(range(len(grid.A)))
+                        if use_commit_mask and epsilon_target is not None
+                        else global_actions
+                    )
                 values[[a for a in range(len(values)) if a not in allowed]] = -np.inf
                 action = int(np.argmax(values))
                 if step == 0:
@@ -164,7 +175,7 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
                 ]
                 if action in epsilon_actions and epsilon_target is None:
                     epsilon_target = action - len(grid.A)
-                observations.append(csrl.observe_observation(state))
+                observations.append(observe(state))
                 previous_actions.append(action)
                 observations = observations[-history_length:]
                 previous_actions = previous_actions[-history_length:]
@@ -193,6 +204,8 @@ def evaluate_checkpoint(path: Path, n_runs: int, horizon: int, seed: int):
         "checkpoint": str(path),
         "run_id": metadata.get("run_id"),
         "history_length": history_length,
+        "automaton_state_observed": automaton_state_observed,
+        "grid_position_partially_observed": bool(metadata.get("partial_observation", True)),
         "seed": metadata.get("seed"),
         "evaluation_seed": seed,
         "rollouts_per_start": n_runs,

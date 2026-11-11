@@ -27,9 +27,14 @@ def load_policy(path: Path):
         )
     elif metadata["architecture"] == "rssm":
         grid, _oa, csrl, *_ = build_environment(float(metadata["observation_error"]))
+        observation_factors = (
+            tuple(csrl.shape[:-1])
+            if metadata.get("automaton_state_observed", False)
+            else (csrl.shape[0], grid.shape[0], grid.shape[1])
+        )
         model = RSSMDQN(
             metadata["n_observations"], metadata["n_actions"],
-            (csrl.shape[0], grid.shape[0], grid.shape[1]),
+            observation_factors,
             hidden_size=metadata["rssm_deterministic_size"],
             stochastic_variables=metadata["rssm_stochastic_variables"],
             categorical_classes=metadata["rssm_categorical_classes"],
@@ -65,7 +70,6 @@ def observation_distribution(mdp, position, error_probability):
 
 
 def encoded_input(csrl, observation, model, metadata, repeat_count, q=None):
-    pair, row, col = observation
     if metadata["architecture"] in ("gru", "rssm"):
         if repeat_count == 1:
             observations = [observation]
@@ -78,6 +82,9 @@ def encoded_input(csrl, observation, model, metadata, repeat_count, q=None):
             history_length=int(metadata["history_length"]),
             previous_actions=previous_actions,
             partial_observation=True,
+            automaton_state_observed=bool(
+                metadata.get("automaton_state_observed", False)
+            ),
             epsilon_commitment_mode=metadata.get("recurrent_epsilon_commitment_mode", "none"),
         ).unsqueeze(0)
 
@@ -86,11 +93,13 @@ def encoded_input(csrl, observation, model, metadata, repeat_count, q=None):
         or metadata.get("automaton_state_observed", False)
     )
     if observes_q:
+        pair, _observed_q, row, col = observation
         factors = tuple(csrl.shape[:-1])
         if q is None:
             raise ValueError("A product-state observation requires an automaton state")
         coordinates = (pair, q, row, col)
     else:
+        pair, row, col = observation
         factors = (csrl.shape[0], csrl.mdp.shape[0], csrl.mdp.shape[1])
         coordinates = (pair, row, col)
     vector = torch.zeros(int(metadata["n_observations"]), dtype=torch.float32)
@@ -124,7 +133,11 @@ def evaluate_panel(model, metadata, grid, oa, csrl, pair, repeat_count):
         action_probabilities: dict[int, float] = {}
         for observed_position, probability in observation_distribution(
                 grid, (row, col), error_probability).items():
-            observation = (pair, observed_position[0], observed_position[1])
+            observation = (
+                (pair, oa.q0, observed_position[0], observed_position[1])
+                if observes_q else
+                (pair, observed_position[0], observed_position[1])
+            )
             encoded = encoded_input(
                 csrl, observation, model, metadata, repeat_count,
                 q=oa.q0 if observes_q else None,
@@ -133,6 +146,8 @@ def evaluate_panel(model, metadata, grid, oa, csrl, pair, repeat_count):
                 q_values = model(encoded).squeeze(0).cpu().numpy()
             if not metadata.get("partial_observation", True):
                 allowed = list(csrl.A[(pair, oa.q0, row, col)])
+            elif observes_q:
+                allowed = csrl.actions_for_observed_q(oa.q0)
             else:
                 allowed = allowed_actions
             action = max(allowed, key=lambda candidate: q_values[candidate])

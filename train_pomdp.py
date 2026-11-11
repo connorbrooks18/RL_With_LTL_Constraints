@@ -47,8 +47,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--reveal-automaton-state", action="store_true",
-        help=("for an MLP, include the true automaton state with the noisy "
-              "position while retaining the partial-observation action interface"),
+        help=("include true q in MLP, GRU, or RSSM observations while keeping "
+              "the grid-position observation noisy"),
     )
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -68,12 +68,12 @@ def main() -> None:
         help="save intermediate policy snapshots at these episode counts",
     )
     args = parser.parse_args()
-    if args.reveal_automaton_state and args.architecture != "mlp":
-        parser.error("--reveal-automaton-state is only valid with --architecture mlp")
     if args.checkpoint_dir is None:
         if args.architecture in ("gru", "rssm"):
+            q_suffix = "_q_observed" if args.reveal_automaton_state else ""
             args.checkpoint_dir = (
-                f"checkpoints_pomdp_{args.architecture}_history{args.history_length}_seed{args.seed}"
+                f"checkpoints_pomdp_{args.architecture}{q_suffix}_history"
+                f"{args.history_length}_seed{args.seed}"
             )
         elif args.reveal_automaton_state:
             args.checkpoint_dir = f"checkpoints_pomdp_mlp_q_observed_seed{args.seed}"

@@ -1,9 +1,9 @@
-"""Compare POMDP GRU-DQN checkpoints with value-iteration policies.
+"""Compare partially observed DQN checkpoints with MDP value-iteration policies.
 
-The primary baseline indexes the full-state MDP value-iteration policy with
-the noisy position observation and an automaton state inferred from the
-controller's own epsilon action and perceived labels. An optional oracle
-reports the MDP policy with access to the true product state for context.
+The baseline indexes the product-MDP policy with the noisy position reading
+and either the observed automaton state or, for historical q-hidden runs, an
+automaton state tracked from the controller's epsilon action and perceived
+labels. An optional oracle reports the policy with the true product state.
 """
 
 from __future__ import annotations
@@ -37,7 +37,11 @@ def _rollout(
     np.random.seed(int(rollout_seed))
     transition_rng = np.random.default_rng(int(rollout_seed) + 1)
     state = (0, csrl.oa.q0, int(start_square[0]), int(start_square[1]))
-    observation = csrl.observe_observation(state)
+    model_observes_q = bool(
+        model is not None and metadata.get("automaton_state_observed", False)
+    )
+    observe = csrl.observe_state if (model_observes_q or automaton_state_observed) else csrl.observe_observation
+    observation = observe(state)
     observations = [observation]
     previous_actions = [None]
     inferred_q = csrl.oa.q0
@@ -59,6 +63,7 @@ def _rollout(
                 history_length=int(metadata["history_length"]),
                 previous_actions=previous_actions,
                 partial_observation=True,
+                automaton_state_observed=model_observes_q,
                 epsilon_committed=epsilon_target is not None,
                 epsilon_target=epsilon_target,
                 epsilon_commitment_mode=metadata.get(
@@ -67,19 +72,25 @@ def _rollout(
             ).unsqueeze(0)
             with torch.no_grad():
                 values = model(history).squeeze(0).cpu().numpy()
-            allowed = (
-                list(range(grid_action_count))
-                if metadata.get("epsilon_commit_mask_from_history", False)
-                and epsilon_target is not None
-                else global_actions
-            )
+            if model_observes_q:
+                allowed = csrl.actions_for_observed_q(state[1])
+            else:
+                allowed = (
+                    list(range(grid_action_count))
+                    if metadata.get("epsilon_commit_mask_from_history", False)
+                    and epsilon_target is not None
+                    else global_actions
+                )
             values[[a for a in range(len(values)) if a not in allowed]] = -np.inf
             action = int(np.argmax(values))
         elif oracle:
             action = int(value_iteration_policy[state])
         else:
-            observed_pair, observed_row, observed_col = observation
-            estimated_q = state[1] if automaton_state_observed else inferred_q
+            if automaton_state_observed:
+                _pair, estimated_q, observed_row, observed_col = observation
+            else:
+                _pair, observed_row, observed_col = observation
+                estimated_q = inferred_q
             estimated_state = (0, estimated_q, observed_row, observed_col)
             if epsilon_target is None:
                 action = int(value_iteration_policy[estimated_state])
@@ -118,14 +129,14 @@ def _rollout(
         if action >= grid_action_count and action in global_epsilon_actions:
             epsilon_target = action - grid_action_count
             inferred_q = epsilon_target
-        elif not oracle:
+        elif not oracle and not (model_observes_q or automaton_state_observed):
             # Product transitions consume the label at the current cell before
             # moving. The observation-only baseline applies the same update to
             # its perceived current cell, which can be wrong under sensor noise.
             perceived_label = csrl.mdp.label[observation[1], observation[2]]
             inferred_q = csrl.oa.delta[inferred_q][perceived_label]
 
-        observation = csrl.observe_observation(state)
+        observation = observe(state)
         observations.append(observation)
         previous_actions.append(action)
         if model is not None:
@@ -223,9 +234,14 @@ def evaluate_checkpoint(
     grid, oa, csrl, valid_starts, _eps, _actions, _sinks = env
 
     if metadata["architecture"] == "rssm":
+        observation_factors = (
+            tuple(csrl.shape[:-1])
+            if metadata.get("automaton_state_observed", False)
+            else (csrl.shape[0], grid.shape[0], grid.shape[1])
+        )
         model = RSSMDQN(
             int(metadata["n_observations"]), int(metadata["n_actions"]),
-            (csrl.shape[0], grid.shape[0], grid.shape[1]),
+            observation_factors,
             hidden_size=int(metadata["rssm_deterministic_size"]),
             stochastic_variables=int(metadata["rssm_stochastic_variables"]),
             categorical_classes=int(metadata["rssm_categorical_classes"]),
@@ -258,6 +274,9 @@ def evaluate_checkpoint(
                 csrl, start_square, rollout_seed, horizon,
                 value_iteration_value=value,
                 value_iteration_policy=vi_policy,
+                automaton_state_observed=bool(
+                    metadata.get("automaton_state_observed", False)
+                ),
             )
             dqn_returns.append(dqn_return)
             vi_returns.append(vi_return)
@@ -312,6 +331,12 @@ def evaluate_checkpoint(
         "run_id": metadata.get("run_id"),
         "history_length": int(metadata["history_length"]),
         "training_seed": metadata.get("seed"),
+        "automaton_state_observed": bool(
+            metadata.get("automaton_state_observed", False)
+        ),
+        "grid_position_partially_observed": bool(
+            metadata.get("partial_observation", True)
+        ),
         "training_episodes": int(metadata.get("episodes", 0)),
         "training_phase": metadata.get("training_phase", "unknown"),
         "training_loop_seconds": float(metadata.get("training_loop_seconds", 0.0)),
@@ -355,8 +380,11 @@ def evaluate_checkpoint(
         ),
         "baseline_definition": (
             "Exact product-MDP value iteration; at execution the policy is indexed "
-            "by the noisy position reading and by an automaton state tracked from "
-            "its own epsilon action and labels inferred from noisy positions."
+            "by the noisy grid-position reading and "
+            + ("the directly observed true automaton state q. It is a point-observation "
+               "MDP policy, not a belief-state POMDP solver."
+               if metadata.get("automaton_state_observed", False)
+               else "an automaton state tracked from its own epsilon action and labels inferred from noisy positions.")
         ),
         "oracle_definition": (
             "Same value-iteration policy with true product state at execution; "

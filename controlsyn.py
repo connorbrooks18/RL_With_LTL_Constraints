@@ -124,6 +124,15 @@ class ControlSynthesis:
         return [state for state in self.mdp.states()
                 if self.mdp.structure[state] != "B"]
 
+    def actions_for_observed_q(self, q):
+        """Return actions determined by visible q without revealing the grid cell."""
+        q = int(q)
+        if not 0 <= q < self.oa.shape[1]:
+            raise ValueError("q is outside the automaton state range")
+        return list(range(len(self.mdp.A))) + [
+            len(self.mdp.A) + int(target) for target in self.oa.eps[q]
+        ]
+
     def observe_state(self, state, error_prob=None):
         """Return a noisy product-state observation, retaining automaton q.
 
@@ -146,7 +155,8 @@ class ControlSynthesis:
         return (i, observed_r, observed_c)
 
     def encode_observation(self, observation, *, partial_observation=True,
-                           previous_action=None, recurrent=False):
+                           previous_action=None, recurrent=False,
+                           automaton_state_observed=False):
         """One-hot encode an observation for a DQN or recurrent DQN.
 
         For partial observations, pass ``(Rabin-pair index, row, column)``.
@@ -157,7 +167,8 @@ class ControlSynthesis:
         encoder appends persistent one-hot epsilon-target memory separately.
         """
         observation = tuple(map(int, observation))
-        if partial_observation:
+        observes_q = bool(automaton_state_observed or not partial_observation)
+        if not observes_q:
             if len(observation) != 3:
                 raise ValueError("Partial observations must be (pair index, row, column)")
             factors = (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
@@ -187,6 +198,7 @@ class ControlSynthesis:
     def encode_observation_history(self, observations, history_length, *,
                                    previous_actions=None,
                                    partial_observation=True,
+                                   automaton_state_observed=False,
                                    epsilon_committed=False,
                                    epsilon_target=None,
                                    epsilon_commitment_mode=None,
@@ -197,17 +209,18 @@ class ControlSynthesis:
         contains the action taken immediately before each corresponding
         observation, or ``None`` for the first observation after reset.
         Histories longer than ``history_length`` are truncated from the left.
-        By default, persistent one-hot features record the target of the most
-        recent epsilon edge chosen by the controller. This is derived from
-        its own actions, not from the hidden automaton state. The legacy
-        ``bit`` mode supports checkpoints that stored only whether an epsilon
-        edge had been chosen; ``none`` supports older checkpoints.
+        ``target_one_hot`` adds persistent controller-owned epsilon-target
+        memory for q-hidden policies. q-visible policies use ``none`` because
+        their current automaton state makes that extra memory redundant. The
+        legacy ``bit`` mode supports checkpoints that stored only whether an
+        epsilon edge had been chosen.
         """
         if history_length <= 0:
             raise ValueError("history_length must be positive")
+        observes_q = bool(automaton_state_observed or not partial_observation)
         factors = (
+            self.shape[:-1] if observes_q else
             (self.shape[0], self.mdp.shape[0], self.mdp.shape[1])
-            if partial_observation else self.shape[:-1]
         )
         observations = list(observations)
         if previous_actions is None:
@@ -255,6 +268,7 @@ class ControlSynthesis:
                 partial_observation=partial_observation,
                 previous_action=action,
                 recurrent=True,
+                automaton_state_observed=automaton_state_observed,
             )
             for observation, action in zip(observations, previous_actions)
         ][-history_length:]
@@ -528,11 +542,13 @@ class ControlSynthesis:
 
         ``architecture="gru"`` and ``architecture="rssm"`` consume the most
         recent ``history_length`` observation tokens. In partial-observation
-        mode each token omits the true automaton state and includes the
+        mode each token omits the true automaton state unless
+        ``automaton_state_observed`` is enabled, and includes the
         preceding action, so the network can track recent automaton progress
         caused by its own epsilon choices. The recurrent state is recomputed
         from this fixed window at each decision; information older than
-        ``history_length`` is not retained. RSSM adds a categorical prior and
+        ``history_length`` is not retained, except for the optional
+        controller-owned epsilon-target feature used when q is hidden. RSSM adds a categorical prior and
         posterior with auxiliary observation, reward, and KL losses.
         When epsilon commitment determines future epsilon availability from
         the controller's own actions, the mask follows that observable history.
@@ -596,9 +612,9 @@ class ControlSynthesis:
             )
         partial_observation = bool(partial_observation)
         automaton_state_observed = bool(automaton_state_observed)
-        if automaton_state_observed and (not partial_observation or recurrent_architecture):
+        if automaton_state_observed and not partial_observation:
             raise ValueError(
-                "automaton_state_observed requires a feedforward partial-action policy"
+                "automaton_state_observed requires a partial-action policy"
             )
         observation_factors = (
             self.shape[:-1]
@@ -614,12 +630,13 @@ class ControlSynthesis:
             n_observations = sum(observation_factors)
             hidden_size = 64
         else:
-            # GRU tokens contain the current observation, a valid-token bit,
-            # and the preceding action. The history encoder adds a persistent
-            # one-hot epsilon-target memory derived from the controller's own
-            # selected edge, so branch identity survives beyond the k-step window.
+            # Recurrent tokens contain the current observation, a valid-token
+            # bit, and preceding action. q-hidden runs also retain explicit
+            # epsilon-target memory; visible q makes that feature redundant.
             recurrent_token_size = sum(observation_factors) + 1 + n_actions
-            epsilon_commitment_size = self.oa.shape[1]
+            epsilon_commitment_size = (
+                0 if automaton_state_observed else self.oa.shape[1]
+            )
             n_observations = recurrent_token_size + epsilon_commitment_size
             hidden_size = (
                 int(rssm_deterministic_size)
@@ -679,6 +696,7 @@ class ControlSynthesis:
         # its own action history without observing hidden q.
         epsilon_commit_mask_supported = (
             partial_observation
+            and not automaton_state_observed
             and recurrent_architecture
             and bool(epsilon_targets)
             and epsilon_sources == {self.oa.q0}
@@ -710,6 +728,7 @@ class ControlSynthesis:
                     partial_observation=partial_observation,
                     previous_action=previous_action,
                     recurrent=True,
+                    automaton_state_observed=automaton_state_observed,
                 ).to(device)
             else:
                 encoded = torch.zeros(n_observations, dtype=torch.float32,
@@ -737,7 +756,7 @@ class ControlSynthesis:
             target_features = torch.zeros(
                 epsilon_commitment_size, dtype=torch.float32, device=device
             )
-            if epsilon_target is not None:
+            if epsilon_target is not None and epsilon_commitment_size:
                 target_features[int(epsilon_target)] = 1.0
             commitment = valid_tokens * target_features.unsqueeze(0)
             encoded_history = torch.cat((encoded_history, commitment), dim=1)
@@ -773,7 +792,15 @@ class ControlSynthesis:
         action_masks = {}
         for state in self.states():
             if partial_observation:
-                action_masks[state] = global_action_mask
+                if automaton_state_observed:
+                    mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
+                    mask[mdp_action_ids] = True
+                    epsilon_ids = self.actions_for_observed_q(state[1])[len(self.mdp.A):]
+                    if epsilon_ids:
+                        mask[epsilon_ids] = True
+                    action_masks[state] = mask
+                else:
+                    action_masks[state] = global_action_mask
             else:
                 mask = torch.zeros(n_actions, dtype=torch.bool, device=device)
                 mask[self.A[state]] = True
@@ -781,6 +808,8 @@ class ControlSynthesis:
 
         def get_action_mask(state, epsilon_committed=False):
             if not partial_observation:
+                return action_masks[state]
+            if automaton_state_observed:
                 return action_masks[state]
             if epsilon_commit_mask_supported and epsilon_committed:
                 return mdp_action_mask
@@ -1115,8 +1144,12 @@ class ControlSynthesis:
                 else:
                     network_input = encoded_states[state]
                 Q[state] = policy_net(network_input).squeeze(0).cpu().numpy()
-                valid_actions = (global_action_ids if partial_observation
-                                 else self.A[state])
+                if not partial_observation:
+                    valid_actions = self.A[state]
+                elif automaton_state_observed:
+                    valid_actions = self.actions_for_observed_q(state[1])
+                else:
+                    valid_actions = global_action_ids
                 Q[state][list(set(range(n_actions)) - set(valid_actions))] = -np.inf
                 if not partial_observation and state[1] in rejecting_sink_qs:
                     Q[state][self.A[state]] = 0.0
@@ -1254,14 +1287,20 @@ class ControlSynthesis:
                 "observation_encoding": (
                     "Rabin-pair index,row,column; automaton state hidden"
                     if partial_observation and not automaton_state_observed else
+                    "Rabin-pair index,automaton state,row,column; grid position noisy"
+                    if partial_observation and automaton_state_observed else
                     "Rabin-pair index,automaton state,row,column"
                 ),
                 "history_length": int(history_length) if recurrent_architecture else None,
                 "gru_hidden_size": int(gru_hidden_size) if architecture == "gru" else None,
                 "recurrent_token_includes_previous_action": recurrent_architecture,
-                "recurrent_input_includes_epsilon_commitment": recurrent_architecture,
+                "recurrent_input_includes_epsilon_commitment": (
+                    recurrent_architecture and epsilon_commitment_size > 0
+                ),
                 "recurrent_epsilon_commitment_mode": (
-                    "target_one_hot" if recurrent_architecture else "none"
+                    "target_one_hot"
+                    if recurrent_architecture and epsilon_commitment_size > 0
+                    else "none"
                 ),
                 "recurrent_epsilon_commitment_size": (
                     int(epsilon_commitment_size) if recurrent_architecture else 0
@@ -1269,6 +1308,9 @@ class ControlSynthesis:
                 "observation_error": float(self.mdp.observation_error),
                 "recurrent_padding": "left zero padding with valid-token bit",
                 "partial_action_semantics": (
+                    "grid moves plus epsilon edges enabled by observed q; "
+                    "grid position remains partially observed"
+                    if partial_observation and automaton_state_observed else
                     "grid moves plus epsilon edges until an observed epsilon commitment; then grid moves only"
                     if epsilon_commit_mask_supported else
                     "all grid moves and epsilon edges; unavailable epsilon is no-op"
