@@ -99,6 +99,13 @@ solver. It scored 0.5331. The paired GRU-minus-VI difference was −0.0081
 This comparison does **not** establish that the GRU beats noisy-input value
 iteration. The recurrent-versus-MLP result remains positive and clear.
 
+For the training-checkpoint curve below, VI is re-evaluated on the same
+20-rollout-per-start, 500-step bank as the GRU. Its mean on this evaluation is
+0.4984. The horizontal line is fixed-policy performance; it is not a value-
+iteration training curve.
+
+![GRU checkpoint returns versus fixed value-iteration performance](figures/gru_vs_value_iteration_returns.png)
+
 ## Set 2: training time and convergence
 
 We compared the full GRU, a GRU trained jointly through episode 10,000 and

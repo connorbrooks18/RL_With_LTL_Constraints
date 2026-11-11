@@ -45,6 +45,17 @@ The full-GRU cohort ran before the frozen/RSSM cohort, and measured throughput
 changed sharply during the campaign. The time differences are descriptive; a
 counterbalanced timing replication is needed for a strong causal speed claim.
 
+### GRU checkpoint returns versus value iteration
+
+![GRU training checkpoints compared with fixed value-iteration performance](figures/gru_vs_value_iteration_returns.png)
+
+This learning-curve comparison evaluates the saved GRU policies at 10k,
+12.5k, and 15k episodes. The dashed value-iteration series is one fixed
+q-aware policy, not a model being trained. Both are evaluated on the same 20
+rollouts per traversable start with a 500-step horizon; the value-iteration
+mean on this bank is 0.4984. Regenerate the figure with
+`venv/bin/python plot_gru_training_vs_value_iteration.py`.
+
 ## Reproduction
 
 Invoke each command serially. The default checkpoint path includes architecture

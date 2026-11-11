@@ -11,6 +11,14 @@ automaton state `q` and keep grid position partially observable.
 - [Experiment protocol and reproduction commands](EXPERIMENTS.md).
 - [Current Section One checkpoint](SECTION_ONE_CHECKPOINT.md).
 
+### GRU training and value-iteration performance
+
+The GRU curve shows greedy policy returns at saved training checkpoints. The
+horizontal value-iteration line is a fixed-policy reference evaluated on the
+same scenarios; value iteration has no training curve.
+
+![GRU checkpoint returns versus fixed value-iteration performance](figures/gru_vs_value_iteration_returns.png)
+
 ## Core implementation
 
 - `controlsyn.py`: product MDP construction and DQN training.

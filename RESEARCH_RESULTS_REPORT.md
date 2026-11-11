@@ -110,6 +110,13 @@ return was 0.5331. The paired GRU-minus-VI difference was −0.0081 (95%
 interval −0.1340 to +0.1178); GRU was higher on two of five seeds. The study
 does not establish GRU superiority over value iteration.
 
+The checkpoint learning curve uses a shorter, matched evaluation protocol:
+20 rollouts per start and a 500-step horizon. On that bank, noisy-input VI
+returned 0.4984. The graph shows GRU checkpoint performance against this fixed
+VI reference; the VI line is not a training trajectory.
+
+![GRU checkpoint returns versus fixed value-iteration performance](figures/gru_vs_value_iteration_returns.png)
+
 ## Experiment 2: training time and convergence
 
 The full-GRU arm reuses Experiment 1 checkpoints. The frozen-GRU and RSSM

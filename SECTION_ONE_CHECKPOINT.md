@@ -21,6 +21,12 @@ observed. All runs were serial.
   Its paired time saving was −326 seconds (95% interval −1,646 to +994); its
   return difference was −0.022 (95% interval −0.169 to +0.124).
 
+The plot compares GRU checkpoint return with value-iteration performance. VI
+is a fixed-policy reference, not a trained model; both series use the same
+20-rollout-per-start, 500-step evaluation bank.
+
+![GRU checkpoint returns versus fixed value-iteration performance](figures/gru_vs_value_iteration_returns.png)
+
 Full methods, per-start 5×4 return tables, per-seed results, timing records,
 convergence summaries, and limitations are in
 [RESEARCH_RESULTS_REPORT.md](RESEARCH_RESULTS_REPORT.md). Protocol and
