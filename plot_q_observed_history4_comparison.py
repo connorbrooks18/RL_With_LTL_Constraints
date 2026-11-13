@@ -40,6 +40,7 @@ def main():
         ),
     }
     matrices = {}
+    per_seed_matrices = {}
     for key, (field, title) in metrics.items():
         matrix = np.full(grid.shape, np.nan, dtype=float)
         values_by_square = {}
@@ -51,8 +52,31 @@ def main():
             matrix[square] = float(np.mean(values))
         matrices[key] = matrix
         visual_values = np.nan_to_num(matrix, nan=0.0)
+        # Small paired differences otherwise render in scientific notation
+        # and crowd the task-grid cell labels. Keep full precision in JSON.
+        if key == "gru_minus_mlp":
+            visual_values = np.round(visual_values, 2)
+            visual_values[np.abs(visual_values) < 0.005] = 0.0
         grid.plot(value=visual_values, save=str(args.output_dir / f"{key}.png"))
         plt.close(plt.gcf())
+
+    for run in data["runs"]:
+        training_seed = int(run["training_seed"])
+        per_seed_matrices[str(training_seed)] = {}
+        for key, field, title in (
+            ("gru", "gru_dqn", "History-4 GRU"),
+            ("mlp", "no_gru_dqn", "Current-observation MLP"),
+        ):
+            matrix = np.full(grid.shape, np.nan, dtype=float)
+            for start in run["starts"]:
+                square = tuple(map(int, start["square"]))
+                matrix[square] = float(start[field]["mean"])
+            per_seed_matrices[str(training_seed)][key] = matrix
+            grid.plot(
+                value=np.nan_to_num(matrix, nan=0.0),
+                save=str(args.output_dir / f"seed{training_seed}_{key}_return.png"),
+            )
+            plt.close(plt.gcf())
 
     raw = {
         "automaton_state_observed": True,
@@ -65,6 +89,16 @@ def main():
             key: [[None if not np.isfinite(value) else float(value) for value in row]
                   for row in matrix]
             for key, matrix in matrices.items()
+        },
+        "per_training_seed": {
+            training_seed: {
+                architecture: [
+                    [None if not np.isfinite(value) else float(value) for value in row]
+                    for row in matrix
+                ]
+                for architecture, matrix in architectures.items()
+            }
+            for training_seed, architectures in per_seed_matrices.items()
         },
     }
     (args.output_dir / "state_value_grids.json").write_text(
@@ -79,6 +113,13 @@ def main():
     ]
     for key, (_field, title) in metrics.items():
         lines.extend([f"## {title}", "", f"![{title}]({key}.png)", ""])
+    lines.extend(["## Final policy maps by training seed", ""])
+    for training_seed in sorted(per_seed_matrices, key=int):
+        lines.extend([
+            f"### Seed {training_seed}", "",
+            f"![Seed {training_seed} GRU final policy return](seed{training_seed}_gru_return.png)", "",
+            f"![Seed {training_seed} MLP final policy return](seed{training_seed}_mlp_return.png)", "",
+        ])
     lines.append("Numeric arrays and labels are in [state_value_grids.json](state_value_grids.json).")
     (args.output_dir / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Saved grid comparison to {args.output_dir}", flush=True)
