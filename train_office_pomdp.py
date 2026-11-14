@@ -43,7 +43,7 @@ def office_metadata():
         "environment_name": "Li 4x4 office abstraction (Figure 11; single agent)",
         "office_geometry_source": (
             "https://github.com/JunchaoLi001/LDGBA-Model_Checking/blob/main/"
-            "Office%20Simulation/Office%20single%20obsv%20by%20SARSOP/csrl/pomdp.py"
+            "Office%20Simulation/Office%20full%20obsv%20by%20SARSOP/csrl/pomdp.py"
         ),
         "task_formula": TASK_FORMULA,
         "start_position": list(START),
@@ -75,8 +75,8 @@ def office_metadata():
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--architecture", choices=("gru", "mlp"), required=True)
-    parser.add_argument("--episodes", type=int, default=30_000)
-    parser.add_argument("--horizon", type=int, default=300)
+    parser.add_argument("--episodes", type=int, default=60_000)
+    parser.add_argument("--horizon", type=int, default=600)
     parser.add_argument("--history-length", type=int, default=4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -89,12 +89,12 @@ def main() -> None:
     parser.add_argument("--discount-nonaccepting", type=float, default=0.99999)
     parser.add_argument("--discount-accepting", type=float, default=0.99)
     parser.add_argument("--checkpoint-dir")
-    parser.add_argument("--checkpoint-episodes", type=int, nargs="*", default=(15_000, 20_000, 25_000))
+    parser.add_argument("--checkpoint-episodes", type=int, nargs="*", default=())
     args = parser.parse_args()
     if args.checkpoint_dir is None:
         args.checkpoint_dir = (
             f"checkpoints_office_{args.architecture}_q_observed_"
-            f"history{args.history_length}_seed{args.seed}_30k"
+            f"history{args.history_length}_seed{args.seed}_60k"
         )
     if any(episode >= args.episodes for episode in args.checkpoint_episodes):
         parser.error("all intermediate checkpoint episodes must be below --episodes")

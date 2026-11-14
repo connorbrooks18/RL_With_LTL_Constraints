@@ -52,12 +52,20 @@ def _rollout(model, metadata, csrl, start, seed, horizon):
     previous_actions = [None]
     total_return = 0.0
     discount = 1.0
-    accepting_cycles = 0
+    completed_delivery_cycles = 0
+    documents_collected = False
     storage_violation = "s" in tuple(csrl.mdp.label[state[2], state[3]])
     grid_action_count = len(csrl.mdp.A)
     history_length = int(metadata.get("history_length") or 4)
 
     for _ in range(0 if storage_violation else horizon):
+        label = tuple(csrl.mdp.label[state[2], state[3]])
+        if label == ("p",):
+            documents_collected = True
+        elif documents_collected and label in (("a",), ("c",)):
+            completed_delivery_cycles += 1
+            documents_collected = False
+
         if metadata["architecture"] == "gru":
             encoded = csrl.encode_observation_history(
                 observations,
@@ -81,8 +89,6 @@ def _rollout(model, metadata, csrl, start, seed, horizon):
         action = int(np.argmax(q_values))
 
         reward = float(csrl.reward[state])
-        if reward > 0:
-            accepting_cycles += 1
         total_return += discount * reward
         discount *= csrl.discount_accepting if reward > 0 else csrl.discount_nonaccepting
 
@@ -102,8 +108,13 @@ def _rollout(model, metadata, csrl, start, seed, horizon):
 
     return {
         "discounted_return": total_return,
-        "accepting_cycles": accepting_cycles,
-        "safe_and_accepting": bool(accepting_cycles >= 1 and not storage_violation),
+        "completed_delivery_cycles": completed_delivery_cycles,
+        "safe_one_cycle_success": bool(
+            completed_delivery_cycles >= 1 and not storage_violation
+        ),
+        "safe_two_cycle_success": bool(
+            completed_delivery_cycles >= 2 and not storage_violation
+        ),
         "storage_violation": storage_violation,
     }
 
@@ -112,8 +123,9 @@ def _paired_rollout_summary(gru, mlp):
     result = {}
     fields = (
         ("discounted_return", "mean_discounted_return"),
-        ("accepting_cycles", "mean_accepting_cycles"),
-        ("safe_and_accepting", "safe_acceptance_rate"),
+        ("completed_delivery_cycles", "mean_delivery_cycles"),
+        ("safe_one_cycle_success", "safe_one_cycle_success_rate"),
+        ("safe_two_cycle_success", "safe_two_cycle_success_rate"),
         ("storage_violation", "storage_violation_rate"),
     )
     for sample_key, output_key in fields:
@@ -204,8 +216,9 @@ def _t_critical(n):
 
 def _across_seeds(reports, metrics_key="metrics"):
     metrics = defaultdict(dict)
-    fields = ("mean_discounted_return", "mean_accepting_cycles",
-              "safe_acceptance_rate", "storage_violation_rate")
+    fields = ("mean_discounted_return", "mean_delivery_cycles",
+              "safe_one_cycle_success_rate", "safe_two_cycle_success_rate",
+              "storage_violation_rate")
     for field in fields:
         by_seed = [report[metrics_key][field]["paired_difference_gru_minus_mlp"]["mean"]
                    for report in reports]

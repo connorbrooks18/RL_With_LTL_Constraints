@@ -1,0 +1,33 @@
+{
+  "selection": {
+    "core": "median paired GRU-minus-MLP outcome at the longest completed budget",
+    "training_time": "median full-GRU endpoint return among completed 15,000-episode reference outcomes; the matched block is used for all three methods"
+  },
+  "core": {
+    "episodes": 60000,
+    "steps_per_episode": 600,
+    "history_length": 4,
+    "position_observation_error": 0.25,
+    "gru": {
+      "mean": 0.5916442792666492,
+      "ci95": [
+        0.5698585006291165,
+        0.6134300579041819
+      ]
+    },
+    "mlp": {
+      "mean": 0.22949714670998164,
+      "ci95": [
+        0.21058642369058367,
+        0.24840786972937962
+      ]
+    },
+    "paired_difference": {
+      "mean": 0.3621471325566677,
+      "ci95": [
+        0.33909764432717415,
+        0.38519662078616124
+      ]
+    }
+  }
+}

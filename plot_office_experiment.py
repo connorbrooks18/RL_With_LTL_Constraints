@@ -56,7 +56,7 @@ def plot_training(checkpoints, output, window):
         means = _rolling_mean(returns, window)
         x = np.arange(len(means)) + min(window, len(returns))
         ax.plot(x, means, color=colors[meta["architecture"]], alpha=.66,
-                linewidth=1.15, label=f"{meta['architecture'].upper()} seed {meta['seed']}")
+                linewidth=1.15, label=meta["architecture"].upper())
     ax.set_xlabel("Training episode")
     ax.set_ylabel(f"Discounted training return ({window}-episode moving average)")
     ax.set_title("Junchao office: training return by architecture")
@@ -79,8 +79,10 @@ def plot_evaluation(report_path, output):
         for architecture in ("gru", "mlp"):
             return_values = [run["metrics"]["mean_discounted_return"][architecture]["mean"]
                              for run in runs]
-            safe_values = [run["thesis_start_metrics"]["safe_acceptance_rate"][architecture]["mean"]
-                           for run in runs]
+            safe_values = [
+                run["thesis_start_metrics"]["safe_two_cycle_success_rate"][architecture]["mean"]
+                for run in runs
+            ]
             for values, store in ((return_values, return_lines), (safe_values, thesis_safe_lines)):
                 array = np.asarray(values, dtype=float)
                 mean = float(array.mean())
@@ -98,8 +100,8 @@ def plot_evaluation(report_path, output):
     for architecture in ("gru", "mlp"):
         for ax, store, title, ylabel in (
             (axes[0], return_lines, "Mean return from all 16 rooms", "Mean discounted return"),
-            (axes[1], thesis_safe_lines, "Safe completion from thesis start (3,3)",
-             "P(acceptance cycle, no storage violation)"),
+            (axes[1], thesis_safe_lines, "Two delivery cycles from thesis start (3,3)",
+             "P(2 cycles, no storage violation)"),
         ):
             values = np.asarray(store[architecture], dtype=float)[order]
             ax.errorbar(episodes / 1000, values[:, 0], yerr=values[:, 1],
@@ -111,7 +113,7 @@ def plot_evaluation(report_path, output):
             ax.grid(alpha=.22)
     axes[0].legend()
     axes[1].legend()
-    fig.suptitle("Office policy evaluation by training budget · mean ± 95% CI across seeds")
+    fig.suptitle("Office Task 1 policy evaluation by training budget")
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180, bbox_inches="tight")
@@ -177,7 +179,7 @@ def plot_policies(gru_path, mlp_path, output):
         ax.grid(which="minor", color="white", linewidth=1.1, alpha=.8)
         ax.tick_params(which="minor", bottom=False, left=False)
         ax.xaxis.tick_top()
-        ax.set_title(f"{title} · seed {meta['seed']} · {meta['episodes']:,} episodes")
+        ax.set_title(f"{title} · {meta['episodes']:,} episodes")
         for row in range(4):
             for col in range(4):
                 props = tuple(mdp.label[row, col])

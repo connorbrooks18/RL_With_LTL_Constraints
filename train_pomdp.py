@@ -105,10 +105,13 @@ def main() -> None:
         f"automaton_state_observed={args.reveal_automaton_state}, seed={args.seed}",
         flush=True,
     )
-    progress_checkpoints = args.checkpoint_episodes or (
-        range(args.freeze_gru_after_episodes + 2_500, args.episodes, 2_500)
-        if args.freeze_gru_after_episodes is not None else ()
-    )
+    if args.checkpoint_episodes is not None:
+        progress_checkpoints = args.checkpoint_episodes
+    else:
+        progress_checkpoints = (
+            range(args.freeze_gru_after_episodes + 2_500, args.episodes, 2_500)
+            if args.freeze_gru_after_episodes is not None else ()
+        )
     _q_values, _transition_counts, _policy_net = csrl.deep_q_learning(
         T=args.horizon,
         K=args.episodes,
